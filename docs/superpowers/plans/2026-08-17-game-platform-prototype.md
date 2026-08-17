@@ -858,7 +858,7 @@ git commit -m "feat(backend): add sequelize models and initial migration"
 **Interfaces:**
 - Consumes: `WordDeck`, `WordDeckEntry` from Task 5.
 - Produces: four decks — `(category: 'general', language: 'uk')`, `('general', 'en')`, `('crocodile', 'uk')`, `('crocodile', 'en')` — each with **at least 120 words**. Crocodile decks hold concrete depictable nouns; general decks hold mixed nouns/verbs/concepts.
-- Produces: `WordDeckService.loadDeck(category, language): Promise<{ deckId: string; words: string[] }>` is added in Task 19, not here.
+- Note: the deck **reader** (`WordDeckService.loadDeck`) is added in Task 15, not here. This task only writes the data.
 
 - [ ] **Step 1: Write the word data files**
 
@@ -984,7 +984,7 @@ git commit -m "feat(backend): add guest, email and oauth authentication"
 - Produces: `UsersService.toPublicUser(user: User): PublicUser`, `UsersService.updateProfile(userId, { nickname?, avatarUrl? })`, `UsersService.searchByNickname(query: string, limit: number): Promise<PublicUser[]>`.
 - Produces: `FriendsService.sendRequest(fromId, toId)`, `.accept(userId, requestId)`, `.decline(userId, requestId)`, `.remove(userId, friendId)`, `.listFriends(userId): Promise<PublicUser[]>`, `.listIncoming(userId)`, `.listOutgoing(userId)`.
 - Produces: `NotificationsService.push(userId, type, payload): Promise<NotificationDto>` — **Task 14 injects this into the gateway to emit `notification` over the socket**; `.list(userId)`, `.markRead(userId, id)`.
-- Produces: routes `GET/PATCH /api/users/me`, `GET /api/users/search?q=`, `GET /api/users/:id/history`, `GET/POST/DELETE /api/friends*`, `GET /api/notifications`, `POST /api/notifications/:id/read`.
+- Produces: routes `GET/PATCH /api/users/me`, `GET /api/users/search?q=`, `GET/POST/DELETE /api/friends*`, `GET /api/notifications`, `POST /api/notifications/:id/read`. (`GET /api/users/:id/history` needs `GameHistoryService` and is added in Task 15.)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1678,7 +1678,7 @@ git commit -m "feat(backend): add websocket gateway with presence, reconnect gra
   `handleTimer(sessionId, timerId): Promise<void>`,
   `finish(sessionId): Promise<void>` — writes `GameResult` rows, sets room status to `results`, emits `game:ended`, clears timers and Redis state, then after 8 seconds returns the room to `lobby` and broadcasts room state,
   `pauseForDisconnect(roomId, userId)` / `resumeAfterReconnect(roomId, userId)` — called by presence.
-- Produces: `GameHistoryService.listForUser(userId, limit): Promise<MatchHistoryEntry[]>` — backs `GET /api/users/:id/history` from Task 8.
+- Produces: `GameHistoryService.listForUser(userId, limit): Promise<MatchHistoryEntry[]>` and the route `GET /api/users/:id/history` that returns it (added to `UsersController` from Task 8).
 - Redis keys: `game:state:{sessionId}` (JSON snapshot), `room:session:{roomId}` (active session id).
 - `InvalidActionError` from a reducer is converted to an `error` event to the acting socket only — it must never crash the gateway or mutate state.
 
@@ -1734,28 +1734,30 @@ git commit -m "feat(backend): add authoritative game runtime with timers and per
 
 - [ ] **Step 1: Write the e2e spec**
 
-The scenario, using two real `socket.io-client` connections:
+Alias requires 4 players per `GAME_CATALOG`, so the scenario uses **four** real `socket.io-client` connections:
 ```ts
 it('runs a full room lifecycle: create -> join -> start alias -> score -> finish', async () => {
-  const host = await guest('Host')
-  const guest2 = await guest('Guest')
+  const [host, ...others] = await Promise.all(
+    ['Host', 'P2', 'P3', 'P4'].map((n) => guest(n)),
+  )
   const room = await createRoom(host)
-  await joinRoom(guest2, room.id)
+  for (const p of others) await joinRoom(p, room.id)
 
-  const hostSocket = await connect(host.accessToken)
-  const guestSocket = await connect(guest2.accessToken)
-  await emit(hostSocket, 'room:join', { roomId: room.id })
-  await emit(guestSocket, 'room:join', { roomId: room.id })
+  const sockets = await Promise.all([host, ...others].map((p) => connect(p.accessToken)))
+  const [hostSocket] = sockets
+  for (const s of sockets) await emit(s, 'room:join', { roomId: room.id })
 
   await emit(hostSocket, 'room:select_game', { roomId: room.id, gameId: 'alias' })
   const started = waitFor(hostSocket, 'game:started')
   await emit(hostSocket, 'game:start', { roomId: room.id })
   expect((await started).gameId).toBe('alias')
 
-  const hostView = await waitFor(hostSocket, 'game:state')
-  const guestView = await waitFor(guestSocket, 'game:state')
-  // exactly one of the two is the explainer and only they can see the word
-  const explainerSocket = hostView.explainerId === host.user.id ? hostSocket : guestSocket
+  const views = await Promise.all(sockets.map((s) => waitFor(s, 'game:state')))
+  // exactly one player is the explainer and only they can see the word
+  expect(views.filter((v) => v.secretWord !== null)).toHaveLength(0) // no word before the round starts
+  const players = [host, ...others]
+  const explainerIndex = players.findIndex((p) => p.user.id === views[0]!.explainerId)
+  const explainerSocket = sockets[explainerIndex]!
   await emit(explainerSocket, 'game:action', { roomId: room.id, action: { type: 'word/start_round' } })
   await emit(explainerSocket, 'game:action', { roomId: room.id, action: { type: 'word/correct' } })
 
@@ -1766,8 +1768,6 @@ it('runs a full room lifecycle: create -> join -> start alias -> score -> finish
 it('rejects a game action from a player whose turn it is not, without breaking the session')
 it('a reconnecting client receives the current room and game state')
 ```
-
-Note: Alias needs 4 players minimum per `GAME_CATALOG`. The e2e helper therefore connects **four** guest clients, not two — adjust the scenario accordingly, or start `crocodile` (min 3). Use four clients so the test exercises Alias, the flagship game.
 
 - [ ] **Step 2: Run to verify it fails, then passes**
 
