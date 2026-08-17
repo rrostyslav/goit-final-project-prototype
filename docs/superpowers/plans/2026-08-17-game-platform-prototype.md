@@ -817,7 +817,7 @@ git commit -m "feat(backend): scaffold nestjs app with typed config and health e
 
 - [ ] **Step 1: Wire Sequelize**
 
-`.sequelizerc` points `config` at `src/database/config.js`, `migrations-path` at `src/database/migrations`, `seeders-path` at `src/database/seeders`. `config.js` reads `DATABASE_URL` from the environment (loading `.env` via `dotenv`) and exports `{ development: { url, dialect: 'postgres' }, production: {...} }`.
+`.sequelizerc` points `config` at `src/database/config.js`, `migrations-path` at `src/database/migrations`, `seeders-path` at `src/database/seeders`. `config.js` reads `DATABASE_URL` from the environment and exports `{ development: { url, dialect: 'postgres' }, production: {...} }`. Load `.env` with Node's built-in `process.loadEnvFile()` inside a try/catch — the same mechanism `main.ts` uses. **Do not add `dotenv`**: one env-loading mechanism per app, and a real environment variable must always win over the file.
 
 `database.module.ts` calls `SequelizeModule.forRootAsync` with `uri: config.databaseUrl`, `models: [...]`, `autoLoadModels: false`, `synchronize: false`, `define: { underscored: true }`.
 
