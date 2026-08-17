@@ -1,0 +1,10 @@
+export const ROOM_MAX_PLAYERS = 10
+export const ROOM_MIN_PLAYERS = 2
+export const RECONNECT_GRACE_MS = 45_000
+export const ROOM_CODE_LENGTH = 6
+export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+export const ROOM_CREATE_RATE_LIMIT = { max: 5, windowMs: 60_000 }
+export const CHAT_MAX_LENGTH = 500
+export const DRAW_STROKE_LOG_LIMIT = 2000
+export const SUPPORTED_LOCALES = ['uk', 'en'] as const
+export type Locale = (typeof SUPPORTED_LOCALES)[number]

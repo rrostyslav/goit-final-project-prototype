@@ -1,1 +1,5 @@
-export const SHARED_PACKAGE_VERSION = '0.0.1'
+export * from './constants'
+export * from './domain'
+export * from './events'
+export * from './game-view'
+export * from './games'
