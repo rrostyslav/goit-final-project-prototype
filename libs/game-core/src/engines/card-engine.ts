@@ -64,13 +64,18 @@ export function pickTrump(rest: Card[]): { trump: Card | null; rest: Card[] } {
  * True if `defend` beats `attack` under Durak rules: same suit needs a higher
  * rank; a trump beats any non-trump; a non-trump never beats a trump; two
  * different non-trump suits never beat each other.
+ *
+ * `trumpSuit` accepts `null` for the (rare, legal) deal where every card
+ * ended up in a hand and none was left for `pickTrump` to expose - see its
+ * own `Card | null` return. With no trump suit in play, nothing is trump, so
+ * the same-suit-higher-rank rule is all that ever applies.
  */
-export function beats(attack: Card, defend: Card, trumpSuit: Suit): boolean {
+export function beats(attack: Card, defend: Card, trumpSuit: Suit | null): boolean {
   if (defend.suit === attack.suit) {
     return defend.rank > attack.rank
   }
-  const defendIsTrump = defend.suit === trumpSuit
-  const attackIsTrump = attack.suit === trumpSuit
+  const defendIsTrump = trumpSuit !== null && defend.suit === trumpSuit
+  const attackIsTrump = trumpSuit !== null && attack.suit === trumpSuit
   return defendIsTrump && !attackIsTrump
 }
 
