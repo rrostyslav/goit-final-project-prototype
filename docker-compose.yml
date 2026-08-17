@@ -28,6 +28,7 @@ services:
     ports:
       - '7880:7880'
       - '7881:7881'
+      - '3478:3478/udp'
       - '50000-50100:50000-50100/udp'
     volumes:
       - ./livekit.dev.yaml:/etc/livekit.yaml:ro

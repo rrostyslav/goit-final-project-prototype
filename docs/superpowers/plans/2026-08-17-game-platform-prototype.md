@@ -298,6 +298,7 @@ services:
     ports:
       - '7880:7880'
       - '7881:7881'
+      - '3478:3478/udp'
       - '50000-50100:50000-50100/udp'
     volumes:
       - ./livekit.dev.yaml:/etc/livekit.yaml:ro
@@ -317,9 +318,9 @@ rtc:
   use_external_ip: false
 turn:
   enabled: true
-  domain: localhost
-  tls_port: 5349
   udp_port: 3478
+# No tls_port/domain locally: LiveKit validates the TURN domain only when
+# tls_port > 0, and it rejects `localhost`. TLS TURN belongs in the Helm chart.
 keys:
   devkey: devsecretdevsecretdevsecretdevsecret32
 logging:
