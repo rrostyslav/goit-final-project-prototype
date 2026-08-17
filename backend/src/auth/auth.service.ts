@@ -10,6 +10,7 @@ import { InjectModel } from '@nestjs/sequelize'
 import bcrypt from 'bcryptjs'
 import type { SignOptions } from 'jsonwebtoken'
 import { UniqueConstraintError } from 'sequelize'
+import { toPublicUser } from '../common/public-user.mapper'
 import { AppConfigService } from '../config/env.config'
 import { User } from '../database/models/user.model'
 
@@ -226,15 +227,6 @@ export class AuthService {
  * normalized. */
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase()
-}
-
-function toPublicUser(user: User): PublicUser {
-  return {
-    id: user.id,
-    nickname: user.nickname,
-    avatarUrl: user.avatarUrl,
-    isGuest: user.isGuest,
-  }
 }
 
 /** AppConfigService only validates JWT_*_TTL as a non-empty string; the

@@ -2,6 +2,7 @@ import type { PublicUser } from '@gp/shared'
 import { Injectable, NotFoundException } from '@nestjs/common'
 import { InjectModel } from '@nestjs/sequelize'
 import { Op } from 'sequelize'
+import { toPublicUser as mapPublicUser } from '../common/public-user.mapper'
 import { User } from '../database/models/user.model'
 
 export interface UpdateProfileInput {
@@ -21,12 +22,7 @@ export class UsersService {
    * `oauthProvider`/`oauthId`, or any other private field. Tasks 9, 15 and
    * 16 all build their DTOs on top of this. */
   toPublicUser(user: User): PublicUser {
-    return {
-      id: user.id,
-      nickname: user.nickname,
-      avatarUrl: user.avatarUrl,
-      isGuest: user.isGuest,
-    }
+    return mapPublicUser(user)
   }
 
   async updateProfile(userId: string, input: UpdateProfileInput): Promise<PublicUser> {
@@ -52,7 +48,7 @@ export class UsersService {
   async searchByNickname(
     query: string,
     limit: number,
-    excludeUserId?: string,
+    excludeUserId: string,
   ): Promise<PublicUser[]> {
     const trimmed = query.trim()
     if (trimmed.length === 0) {
@@ -63,7 +59,7 @@ export class UsersService {
     const rows = await this.userModel.findAll({
       where: {
         nickname: { [Op.iLike]: `%${trimmed}%` },
-        ...(excludeUserId ? { id: { [Op.ne]: excludeUserId } } : {}),
+        id: { [Op.ne]: excludeUserId },
       },
       limit: boundedLimit,
       order: [['nickname', 'ASC']],
