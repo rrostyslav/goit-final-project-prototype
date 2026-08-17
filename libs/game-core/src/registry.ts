@@ -1,5 +1,6 @@
 import type { GameId } from '@gp/shared'
 import type { GameDefinition } from './contract'
+import { aliasDefinition, hatDefinition } from './games/alias'
 
 /**
  * The game registry. Deliberately typed `Partial<Record<GameId, GameDefinition>>`
@@ -34,3 +35,8 @@ export function getGameDefinition(id: GameId): GameDefinition {
   }
   return definition
 }
+
+// Alias and Hat (Task 12) register themselves here so any caller that only
+// imports the registry - not the individual game modules - still finds them.
+registerGameDefinition(aliasDefinition)
+registerGameDefinition(hatDefinition)

@@ -1,5 +1,6 @@
 export * from './contract'
 export * from './engines/card-engine'
 export * from './engines/word-engine'
+export * from './games/alias'
 export * from './registry'
 export * from './rng'
