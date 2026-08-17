@@ -21,7 +21,15 @@ export interface WordRoundState {
   currentWord: string | null
   roundEndsAt: number | null
   pausedRemainingMs: number | null
-  roundResults: { word: string; guessed: boolean }[]
+  /**
+   * Every word scored so far, all game, tagged with the `turn` it was scored
+   * on. This is the full history - kept on state deliberately (e.g. Task 16
+   * persists the final state, and a full per-word history is worth keeping)
+   * - not a per-turn view. Games that want just the turn that ended, not the
+   * whole game's pile, use `resultsForTurn` below rather than reading this
+   * array directly.
+   */
+  roundResults: { word: string; guessed: boolean; turn: number }[]
 }
 
 /**
@@ -120,8 +128,27 @@ export function scoreWord(
   const teams = state.teams.map((team, index) =>
     index === state.activeTeamIndex ? { ...team, score: team.score + delta } : team,
   )
-  const roundResults = [...state.roundResults, { word: state.currentWord ?? '', guessed }]
+  const roundResults = [
+    ...state.roundResults,
+    { word: state.currentWord ?? '', guessed, turn: state.turn },
+  ]
   return { ...state, teams, roundResults }
+}
+
+/**
+ * The subset of `roundResults` scored during turn `turn`, with the turn tag
+ * stripped back off. `roundResults` on state accumulates every word played
+ * all game; a game's `view()` uses this to show only the turn that is
+ * currently active or that just ended, not the whole game's history, so a
+ * "last turn" field on the client doesn't grow into "every turn ever".
+ */
+export function resultsForTurn(
+  state: WordRoundState,
+  turn: number,
+): { word: string; guessed: boolean }[] {
+  return state.roundResults
+    .filter((entry) => entry.turn === turn)
+    .map((entry) => ({ word: entry.word, guessed: entry.guessed }))
 }
 
 /**

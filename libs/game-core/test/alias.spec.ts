@@ -262,6 +262,143 @@ describe('alias / hat', () => {
     expect(s).toEqual(before)
   })
 
+  it('lastResults reflects only the turn that just ended, not the whole game history', () => {
+    const def = getGameDefinition('alias')
+    let s = def.init({
+      players: PLAYERS,
+      seed: 5,
+      options: { totalRounds: 2 },
+      deck: ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7', 'w8'],
+      now: 0,
+    })
+
+    // Turn 1: team-0's explainer (a) scores two correct guesses.
+    let explainerId = wordView(def.view(s, 'a')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
+    const afterTurn1 = wordView(def.view(s, explainerId)).lastResults
+    expect(afterTurn1).toEqual([
+      { word: 'w1', guessed: true },
+      { word: 'w2', guessed: true },
+    ])
+
+    // Turn 2: team-1's explainer (b) scores one correct guess and one skip.
+    explainerId = wordView(def.view(s, 'b')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/skip' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
+    const afterTurn2 = wordView(def.view(s, explainerId)).lastResults
+    // Only turn 2's two entries - turn 1's words must not still be present.
+    expect(afterTurn2).toHaveLength(2)
+    expect(afterTurn2).toEqual([
+      { word: 'w4', guessed: true },
+      { word: 'w5', guessed: false },
+    ])
+  })
+
+  it('parseOptions clamps an oversized teamCount so no team is ever left empty (teamCount: 5, players: 2)', () => {
+    const def = getGameDefinition('alias')
+    const s = def.init({
+      players: ['a', 'b'],
+      seed: 1,
+      options: { teamCount: 5 },
+      deck: ['w1', 'w2', 'w3'],
+      now: 0,
+    })
+    const view = wordView(def.view(s, 'a'))
+    // teamCount is clamped to max(2, floor(playerCount / 2)) = max(2, 1) = 2:
+    // never below 2, never so high that a team ends up with no members.
+    expect(view.teams).toHaveLength(2)
+    for (const team of view.teams) {
+      expect(team.memberIds.length).toBeGreaterThan(0)
+    }
+    // The game must actually be playable: an empty active team would make
+    // currentExplainer return null and requireExplainer throw 'not_explainer'
+    // to every player, permanently, with no recovery path.
+    expect(view.explainerId).not.toBeNull()
+    const explainerId = view.explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    const eff = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId))
+    expect(wordView(def.view(eff.state, explainerId)).phase).toBe('active')
+  })
+
+  it('clamps totalRounds: 0 up to 1 instead of shipping a bogus already-over game', () => {
+    const def = getGameDefinition('alias')
+    const s = def.init({
+      players: PLAYERS,
+      seed: 1,
+      options: { totalRounds: 0 },
+      deck: ['w1', 'w2'],
+      now: 0,
+    })
+    expect((s as { finished: boolean }).finished).toBe(false)
+    expect(wordView(def.view(s, 'a')).totalRounds).toBe(1)
+  })
+
+  it('ranks tied team scores with standard competition ranking (1, 1, 3)', () => {
+    // 6 players, teamCount: 3 -> team-0 = [a, d], team-1 = [b, e], team-2 = [c, f].
+    const def = getGameDefinition('alias')
+    let s = def.init({
+      players: ['a', 'b', 'c', 'd', 'e', 'f'],
+      seed: 9,
+      options: { teamCount: 3, totalRounds: 1 },
+      // Each turn draws one extra word beyond what it scores (the word
+      // in flight when end_round fires is drawn but never scored, and is
+      // discarded rather than replayed) - 8 covers 3 turns' worth of draws.
+      deck: ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7', 'w8'],
+      now: 0,
+    })
+
+    // Turn 1: team-0's explainer (a) scores two correct guesses -> score 2.
+    let explainerId = wordView(def.view(s, 'a')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    expect(explainerId).toBe('a')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
+
+    // Turn 2: team-1's explainer (b) scores two correct guesses -> score 2, tied with team-0.
+    explainerId = wordView(def.view(s, 'b')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    expect(explainerId).toBe('b')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
+
+    // Turn 3: team-2's explainer (c) scores one correct guess -> score 1, strictly last.
+    explainerId = wordView(def.view(s, 'c')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    expect(explainerId).toBe('c')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    const finalEff = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId))
+    s = finalEff.state
+    expect((s as { finished: boolean }).finished).toBe(true)
+
+    const results = def.results(s)
+    expect(results).toHaveLength(6)
+    // Standard competition ranking: two teams tied for first, then a gap to 3rd
+    // (not 1, 1, 2) - the tied teams occupy placements 1 and 1, and the next
+    // distinct score skips to 3, the number of teams ranked above it plus one.
+    expect(results.map((r) => r.score)).toEqual([2, 2, 2, 2, 1, 1])
+    expect(results.map((r) => r.placement)).toEqual([1, 1, 1, 1, 3, 3])
+    const byPlayer = Object.fromEntries(results.map((r) => [r.playerId, r]))
+    // Every member of a tied team gets that team's own score and placement.
+    expect(byPlayer.a).toEqual({ playerId: 'a', score: 2, placement: 1 })
+    expect(byPlayer.d).toEqual({ playerId: 'd', score: 2, placement: 1 })
+    expect(byPlayer.b).toEqual({ playerId: 'b', score: 2, placement: 1 })
+    expect(byPlayer.e).toEqual({ playerId: 'e', score: 2, placement: 1 })
+    expect(byPlayer.c).toEqual({ playerId: 'c', score: 1, placement: 3 })
+    expect(byPlayer.f).toEqual({ playerId: 'f', score: 1, placement: 3 })
+  })
+
   it('the serialized view for a non-explainer never contains the secret word', () => {
     const def = getGameDefinition('alias')
     let s = def.init({

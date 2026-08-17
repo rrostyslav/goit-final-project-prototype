@@ -15,6 +15,7 @@ import {
   currentRound,
   drawWord,
   isWordGameOver,
+  resultsForTurn,
   scoreWord,
   startRound,
   type WordRoundState,
@@ -44,17 +45,59 @@ interface AliasOptions {
 
 const DEFAULT_OPTIONS: AliasOptions = { totalRounds: 4, roundMs: 60_000, teamCount: 2 }
 
+/** teamCount is never allowed below this - a "team game" with one team isn't one. */
+const MIN_TEAM_COUNT = 2
+/** roundMs sane band: at least 5s (a round that ends before anyone can act is pointless)
+ *  and at most 10 minutes (a runaway value should not be able to wedge a turn open forever). */
+const MIN_ROUND_MS = 5_000
+const MAX_ROUND_MS = 600_000
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.floor(value)))
+}
+
+function finiteNumberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
 /**
  * Reads `options` defensively: InitContext.options is `Record<string, unknown>`
  * (it crosses a JSON boundary from Task 16 onward), so each field is checked
  * for its expected type before use rather than trusted or cast.
+ *
+ * `teamCount` is additionally clamped against `playerCount`: `buildTeams`
+ * deals players round-robin, so a `teamCount` that outruns the player count
+ * leaves some teams empty, and an empty active team means `currentExplainer`
+ * returns null and every action permanently throws `not_explainer` - a
+ * soft-lock with no recovery path. The rule applied here: every team needs
+ * at least one member, and a team-based word game needs at least two members
+ * per team to be meaningful (someone to explain, someone to guess), so
+ * `teamCount` is capped at `Math.floor(playerCount / 2)`. It is never let
+ * below `MIN_TEAM_COUNT` (2) either, even if that cap would otherwise dip
+ * under it (a `playerCount` below this game's own catalog `minPlayers` of 4
+ * should not happen via the normal room/lobby flow, but `options` - unlike
+ * `players` - arrives already untrusted, so the floor stays absolute rather
+ * than silently going below "two teams").
  */
-function parseOptions(options: Record<string, unknown>): AliasOptions {
-  const totalRounds =
-    typeof options.totalRounds === 'number' ? options.totalRounds : DEFAULT_OPTIONS.totalRounds
-  const roundMs = typeof options.roundMs === 'number' ? options.roundMs : DEFAULT_OPTIONS.roundMs
-  const teamCount =
-    typeof options.teamCount === 'number' ? options.teamCount : DEFAULT_OPTIONS.teamCount
+function parseOptions(options: Record<string, unknown>, playerCount: number): AliasOptions {
+  const totalRounds = Math.max(
+    1,
+    Math.floor(finiteNumberOr(options.totalRounds, DEFAULT_OPTIONS.totalRounds)),
+  )
+
+  const roundMs = clampInt(
+    finiteNumberOr(options.roundMs, DEFAULT_OPTIONS.roundMs),
+    MIN_ROUND_MS,
+    MAX_ROUND_MS,
+  )
+
+  const maxTeamCount = Math.max(MIN_TEAM_COUNT, Math.floor(playerCount / 2))
+  const teamCount = clampInt(
+    finiteNumberOr(options.teamCount, DEFAULT_OPTIONS.teamCount),
+    MIN_TEAM_COUNT,
+    maxTeamCount,
+  )
+
   return { totalRounds, roundMs, teamCount }
 }
 
@@ -111,13 +154,18 @@ export function createAliasDefinition(
     meta,
 
     init(ctx: InitContext): AliasState {
-      const options = parseOptions(ctx.options)
+      const options = parseOptions(ctx.options, ctx.players.length)
       const round = createWordRound(ctx.players, ctx.deck ?? [], {
         totalTurns: options.totalRounds * options.teamCount,
         teamCount: options.teamCount,
         roundMs: options.roundMs,
       })
-      return { round, mode, started: false, finished: false }
+      // Settle `finished` from whatever totalTurns actually came out to,
+      // rather than assuming init always yields a playable game. parseOptions
+      // clamps totalRounds to at least 1, so this is normally false, but the
+      // invariant ("finished reflects isWordGameOver") should hold regardless
+      // of how options arrive rather than relying on that clamp alone.
+      return { round, mode, started: false, finished: isWordGameOver(round) }
     },
 
     reduce(state: AliasState, action: GameAction, ctx: ActionContext): Effect<AliasState> {
@@ -169,7 +217,7 @@ export function createAliasDefinition(
       }
     },
 
-    onTimer(state: AliasState, timerId: string): Effect<AliasState> {
+    onTimer(state: AliasState, timerId: string, _ctx: ActionContext): Effect<AliasState> {
       // A timer for a different id, or one that fires after the turn was
       // already ended manually (word/end_round beat the clock), is a no-op:
       // acting on it again would double-advance the turn.
@@ -195,6 +243,16 @@ export function createAliasDefinition(
         Number.NEGATIVE_INFINITY,
       )
 
+      // lastResults must be scoped to a single turn, not the whole game:
+      // state.round.roundResults accumulates every word played all game (kept
+      // there for history/persistence), while this view field promises "the
+      // turn that just happened" to the client. While a turn is active
+      // (started) that's the in-progress turn; once it has ended (started is
+      // false again, ahead of the next explainer starting theirs) advanceTurn
+      // has already bumped state.round.turn, so the turn that just finished
+      // is turn - 1.
+      const lastResultsTurn = state.started ? state.round.turn : state.round.turn - 1
+
       return {
         kind: 'word',
         gameId: mode,
@@ -208,7 +266,7 @@ export function createAliasDefinition(
           explainerId !== null && viewerId === explainerId ? state.round.currentWord : null,
         roundEndsAt: state.round.roundEndsAt,
         roundPaused: state.round.pausedRemainingMs !== null,
-        lastResults: state.round.roundResults,
+        lastResults: resultsForTurn(state.round, lastResultsTurn),
         winnerTeamIds: state.finished
           ? state.round.teams.filter((team) => team.score === maxScore).map((team) => team.id)
           : [],

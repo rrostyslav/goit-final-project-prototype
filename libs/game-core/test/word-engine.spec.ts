@@ -8,6 +8,7 @@ import {
   drawWord,
   isWordGameOver,
   pauseRound,
+  resultsForTurn,
   resumeRound,
   scoreWord,
   startRound,
@@ -243,5 +244,51 @@ describe('word-engine', () => {
     expect(currentRound({ ...s, turn: 1 })).toBe(1)
     expect(currentRound({ ...s, turn: 2 })).toBe(2)
     expect(currentRound({ ...s, turn: 4 })).toBe(4)
+  })
+
+  it('isWordGameOver is true from turn 1 when totalTurns is 0', () => {
+    // turn starts at 1, so a totalTurns of 0 must report over immediately -
+    // no bogus playable turn before the game reports finished.
+    const s = createWordRound(['a', 'b'], ['w1'], {
+      totalTurns: 0,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    expect(s.turn).toBe(1)
+    expect(isWordGameOver(s)).toBe(true)
+  })
+
+  it('scoreWord tags each roundResults entry with the turn it was scored on', () => {
+    let s = createWordRound(['a', 'b', 'c', 'd'], ['w1', 'w2', 'w3'], {
+      totalTurns: 2,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    s = drawWord(s) // 'w1', turn 1
+    s = scoreWord(s, true, { correct: 1, skip: -1 })
+    s = advanceTurn(s) // turn 2
+    s = drawWord(s) // 'w2', turn 2
+    s = scoreWord(s, false, { correct: 1, skip: -1 })
+    expect(s.roundResults).toEqual([
+      { word: 'w1', guessed: true, turn: 1 },
+      { word: 'w2', guessed: false, turn: 2 },
+    ])
+  })
+
+  it('resultsForTurn returns only the entries for the given turn, with the tag stripped', () => {
+    let s = createWordRound(['a', 'b', 'c', 'd'], ['w1', 'w2', 'w3'], {
+      totalTurns: 2,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    s = drawWord(s) // 'w1', turn 1
+    s = scoreWord(s, true, { correct: 1, skip: -1 })
+    s = advanceTurn(s) // turn 2
+    s = drawWord(s) // 'w2', turn 2
+    s = scoreWord(s, false, { correct: 1, skip: -1 })
+    expect(resultsForTurn(s, 1)).toEqual([{ word: 'w1', guessed: true }])
+    expect(resultsForTurn(s, 2)).toEqual([{ word: 'w2', guessed: false }])
+    // A turn with no scored words yet (or one that never happened) yields [].
+    expect(resultsForTurn(s, 3)).toEqual([])
   })
 })
