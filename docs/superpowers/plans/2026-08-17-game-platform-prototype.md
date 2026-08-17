@@ -858,7 +858,7 @@ git commit -m "feat(backend): add sequelize models and initial migration"
 **Interfaces:**
 - Consumes: `WordDeck`, `WordDeckEntry` from Task 5.
 - Produces: four decks — `(category: 'general', language: 'uk')`, `('general', 'en')`, `('crocodile', 'uk')`, `('crocodile', 'en')` — each with **at least 120 words**. Crocodile decks hold concrete depictable nouns; general decks hold mixed nouns/verbs/concepts.
-- Note: the deck **reader** (`WordDeckService.loadDeck`) is added in Task 15, not here. This task only writes the data.
+- Note: the deck **reader** (`WordDeckService.loadDeck`) is added in Task 16, not here. This task only writes the data.
 
 - [ ] **Step 1: Write the word data files**
 
@@ -913,7 +913,7 @@ git commit -m "feat(backend): seed ukrainian and english word decks"
   `refresh(refreshToken: string): Promise<...>`,
   `upgradeGuest(userId: UserId, email: string, password: string): Promise<...>`,
   `findOrCreateOAuthUser(profile: { provider, providerId, email, nickname, avatarUrl }): Promise<...>`,
-  `verifyAccessToken(token: string): Promise<PublicUser>` — used by the WS gateway in Task 14.
+  `verifyAccessToken(token: string): Promise<PublicUser>` — used by the WS gateway in Task 15.
 - Produces: `@CurrentUser()` param decorator returning `PublicUser`, `JwtAuthGuard` (401 when absent), `OptionalJwtGuard` (attaches user if present).
 - Produces: routes `POST /api/auth/guest`, `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/refresh`, `POST /api/auth/logout`, `POST /api/auth/upgrade`, `GET /api/auth/me`, and — only when `config.oauthEnabled` — `GET /api/auth/google`, `GET /api/auth/google/callback`.
 - Produces: refresh token set as httpOnly cookie `refresh_token`, `sameSite: 'lax'`, path `/api/auth`.
@@ -983,8 +983,8 @@ git commit -m "feat(backend): add guest, email and oauth authentication"
 - Consumes: `Friendship`, `Notification`, `User` models; `JwtAuthGuard`, `@CurrentUser()`.
 - Produces: `UsersService.toPublicUser(user: User): PublicUser`, `UsersService.updateProfile(userId, { nickname?, avatarUrl? })`, `UsersService.searchByNickname(query: string, limit: number): Promise<PublicUser[]>`.
 - Produces: `FriendsService.sendRequest(fromId, toId)`, `.accept(userId, requestId)`, `.decline(userId, requestId)`, `.remove(userId, friendId)`, `.listFriends(userId): Promise<PublicUser[]>`, `.listIncoming(userId)`, `.listOutgoing(userId)`.
-- Produces: `NotificationsService.push(userId, type, payload): Promise<NotificationDto>` — **Task 14 injects this into the gateway to emit `notification` over the socket**; `.list(userId)`, `.markRead(userId, id)`.
-- Produces: routes `GET/PATCH /api/users/me`, `GET /api/users/search?q=`, `GET/POST/DELETE /api/friends*`, `GET /api/notifications`, `POST /api/notifications/:id/read`. (`GET /api/users/:id/history` needs `GameHistoryService` and is added in Task 15.)
+- Produces: `NotificationsService.push(userId, type, payload): Promise<NotificationDto>` — **Task 15 injects this into the gateway to emit `notification` over the socket**; `.list(userId)`, `.markRead(userId, id)`.
+- Produces: routes `GET/PATCH /api/users/me`, `GET /api/users/search?q=`, `GET/POST/DELETE /api/friends*`, `GET /api/notifications`, `POST /api/notifications/:id/read`. (`GET /api/users/:id/history` needs `GameHistoryService` and is added in Task 16.)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1528,7 +1528,7 @@ git commit -m "feat(game-core): implement durak on the card engine"
 
 ---
 
-### Task 13b: Crocodile and Nine — the reuse proof
+### Task 14: Crocodile and Nine — the reuse proof
 
 **Files:**
 - Create: `libs/game-core/src/games/crocodile.ts`, `src/games/nine.ts`
@@ -1581,7 +1581,7 @@ git commit -m "feat(game-core): add crocodile and nine, reusing existing engines
 
 # Phase 5 — Realtime and runtime
 
-### Task 14: WebSocket gateway, presence and chat
+### Task 15: WebSocket gateway, presence and chat
 
 **Files:**
 - Create: `backend/src/realtime/realtime.module.ts`, `realtime.gateway.ts`, `presence.service.ts`, `redis.module.ts`, `redis.service.ts`, `socket-user.ts`
@@ -1597,8 +1597,8 @@ git commit -m "feat(game-core): add crocodile and nine, reusing existing engines
   `cancelEviction(roomId, userId)`,
   `getConnection(roomId, userId): ConnectionState`,
   `setEvictionHandler(fn: (roomId, userId) => Promise<void>)`.
-- Produces: `RealtimeGateway.broadcastRoomState(roomId)` and `.emitToUser(userId, event, payload)` — **Task 15 and Task 17 call these**.
-- Handlers implemented here: `room:join`, `room:leave`, `room:ready`, `room:chat`, `room:select_game`, `room:vote_game`, `room:kick`, `room:ban`, `room:transfer_host`. Game and voice handlers land in Tasks 15 and 17.
+- Produces: `RealtimeGateway.broadcastRoomState(roomId)` and `.emitToUser(userId, event, payload)` — **Task 16 and Task 18 call these**.
+- Handlers implemented here: `room:join`, `room:leave`, `room:ready`, `room:chat`, `room:select_game`, `room:vote_game`, `room:kick`, `room:ban`, `room:transfer_host`. Game and voice handlers land in Tasks 16 and 18.
 - Chat messages are validated against `CHAT_MAX_LENGTH` and rate-limited to 10 messages / 10 s per user.
 
 - [ ] **Step 1: Write the failing presence tests**
@@ -1661,7 +1661,7 @@ git commit -m "feat(backend): add websocket gateway with presence, reconnect gra
 
 ---
 
-### Task 15: Game runtime
+### Task 16: Game runtime
 
 **Files:**
 - Create: `backend/src/games/games.module.ts`, `game-runtime.service.ts`, `game-timer.service.ts`, `word-deck.service.ts`, `game-history.service.ts`
@@ -1724,7 +1724,7 @@ git commit -m "feat(backend): add authoritative game runtime with timers and per
 
 ---
 
-### Task 16: End-to-end socket test
+### Task 17: End-to-end socket test
 
 **Files:**
 - Create: `backend/jest.e2e.config.js`, `backend/test/e2e/room-game.e2e-spec.ts`, `backend/test/e2e/helpers.ts`
@@ -1783,7 +1783,7 @@ git commit -m "test(backend): add end-to-end socket scenario for a full alias ga
 
 ---
 
-### Task 17: Voice tokens and the drawing channel
+### Task 18: Voice tokens and the drawing channel
 
 **Files:**
 - Create: `backend/src/voice/voice.module.ts`, `voice.service.ts`
@@ -1839,7 +1839,7 @@ git commit -m "feat(backend): issue livekit tokens and relay crocodile drawing s
 
 # Phase 6 — Frontend
 
-### Task 18: Next.js skeleton, i18n and API client
+### Task 19: Next.js skeleton, i18n and API client
 
 **Files:**
 - Create: `frontend/package.json`, `tsconfig.json`, `next.config.ts`, `postcss.config.mjs`, `src/app/globals.css`
@@ -1881,7 +1881,7 @@ git commit -m "feat(frontend): scaffold next.js app with i18n, api client and gu
 
 ---
 
-### Task 19: Auth pages and room browser
+### Task 20: Auth pages and room browser
 
 **Files:**
 - Create: `frontend/src/app/login/page.tsx`, `src/app/register/page.tsx`, `src/app/rooms/page.tsx`, `src/app/profile/page.tsx`
@@ -1913,7 +1913,7 @@ git commit -m "feat(frontend): add auth pages, room browser and profile with fri
 
 ---
 
-### Task 20: Room page — socket, lobby and voice
+### Task 21: Room page — socket, lobby and voice
 
 **Files:**
 - Create: `frontend/src/app/room/[code]/page.tsx`
@@ -1926,7 +1926,7 @@ git commit -m "feat(frontend): add auth pages, room browser and profile with fri
 - Produces: `createSocket(token: string): Socket<ServerToClientEvents, ClientToServerEvents>` connecting to `NEXT_PUBLIC_WS_URL + SOCKET_NAMESPACE` with `auth: { token }` and `reconnection: true`.
 - Produces: `useRoomStore` with `room: RoomDto | null`, `messages: ChatMessageDto[]`, `view: PlayerView | null`, `standings`, `votes`, and actions `join`, `leave`, `setReady`, `sendChat`, `selectGame`, `voteGame`, `startGame`, `sendAction`, `kick`, `ban`, `transferHost`.
 - Produces: `useVoice(roomId)` returning `{ enabled, connected, muted, speakers: Set<UserId>, toggleMute() }` — requests `voice:token`, calls `Room.connect(url, token)`, `enableMicrophone()`, subscribes to `RoomEvent.ActiveSpeakersChanged` and `RoomEvent.TrackSubscribed` (attaching remote audio elements). **Disconnects only on unmount of `/room/[code]`, never on `room.status` change.**
-- Produces: `/room/[code]` as a single client component that resolves the code to a room, joins it, and switches its main area on `room.status` — `lobby` → `<Lobby/>`, `in_game` → the game screen from Task 21/22, `results` → `<ResultsScreen/>`. `<VoicePanel/>` and `<ChatPanel/>` render outside that switch so they never unmount.
+- Produces: `/room/[code]` as a single client component that resolves the code to a room, joins it, and switches its main area on `room.status` — `lobby` → `<Lobby/>`, `in_game` → the game screen from Task 22/23, `results` → `<ResultsScreen/>`. `<VoicePanel/>` and `<ChatPanel/>` render outside that switch so they never unmount.
 
 - [ ] **Step 1: Implement the socket layer and store**
 
@@ -1953,7 +1953,7 @@ git commit -m "feat(frontend): add room page with socket store, lobby, chat and 
 
 ---
 
-### Task 21: Word game screens
+### Task 22: Word game screens
 
 **Files:**
 - Create: `frontend/src/components/games/word/{word-game-screen.tsx,round-timer.tsx,team-scoreboard.tsx,explainer-controls.tsx,guesser-view.tsx}`
@@ -1989,7 +1989,7 @@ git commit -m "feat(frontend): add alias, hat and crocodile game screens"
 
 ---
 
-### Task 22: Card game screen and results
+### Task 23: Card game screen and results
 
 **Files:**
 - Create: `frontend/src/components/games/card/{card-game-screen.tsx,playing-card.tsx,hand.tsx,table.tsx,opponent-row.tsx}`
@@ -2218,17 +2218,17 @@ git commit -m "docs: add readme with quick start and verification steps"
 | §2 repo structure, Nx, Biome, dependency direction | 1 |
 | §3.1 game contract | 10 |
 | §3.2 engines | 11 |
-| §3.3 five games, drawing off-state | 12, 13, 13b, 17, 21 |
-| §4 realtime, runtime, room lifecycle, reconnect | 14, 15, 16 |
-| §5 voice | 17, 20 |
+| §3.3 five games, drawing off-state | 12, 13, 14, 18, 22 |
+| §4 realtime, runtime, room lifecycle, reconnect | 15, 16, 17 |
+| §5 voice | 18, 21 |
 | §6 data model incl. WordDeckEntry, RoomBan | 5, 6 |
 | §7 auth incl. guest upgrade, flagged OAuth | 7 |
-| §8 frontend routes and non-remounting voice | 18, 19, 20, 21, 22 |
-| §9 tests | 10–13, 13b, 14, 15, 16 |
+| §8 frontend routes and non-remounting voice | 19, 20, 21, 22, 23 |
+| §9 tests | 10–14, 15, 16, 17 |
 | §10 infra configs | 24, 25, 26, 27 |
 | §11 risk mitigations | 10 (`view`), 15 (`InvalidActionError`), 17 (voice flag), 13b (reuse proof) |
-| friends, notifications, scoreboard, moderation | 8, 9, 15, 19 |
+| friends, notifications, scoreboard, moderation | 8, 9, 16, 20 |
 
 **Type consistency** — `PlayerView`, `GameAction`, `GameEvent`, `Effect`, `GameDefinition`, `VoiceCredentials`, `RoomDto`, `RoomBrowserEntry`, `MatchHistoryEntry` are defined once (Tasks 3 and 10) and referenced by those exact names everywhere after.
 
-**Execution order:** tasks run in document order — 1 … 13, 13b, 14 … 28. Task 13b sits in Phase 4 because Task 21 renders Crocodile's UI and needs its reducer to already exist.
+**Execution order:** tasks run in document order, 1 through 28. Task 14 sits in Phase 4 because Task 22 renders Crocodile's UI and needs its reducer to already exist.
