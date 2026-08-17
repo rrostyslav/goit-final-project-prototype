@@ -3,5 +3,6 @@ packages:
   - 'backend'
   - 'frontend'
 allowBuilds:
+  esbuild: true
   nx: true
   unrs-resolver: true

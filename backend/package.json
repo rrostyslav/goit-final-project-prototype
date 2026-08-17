@@ -13,6 +13,7 @@
     "db:seed": "sequelize-cli db:seed:all"
   },
   "dependencies": {
+    "@gp/game-core": "workspace:*",
     "@gp/shared": "workspace:*",
     "@nestjs/common": "^11.2.1",
     "@nestjs/config": "^4.0.4",
