@@ -62,18 +62,24 @@ export class AuthService {
   }
 
   async register(email: string, password: string, nickname: string): Promise<AuthSession> {
-    const existing = await this.userModel.findOne({ where: { email } })
+    const normalizedEmail = normalizeEmail(email)
+    const existing = await this.userModel.findOne({ where: { email: normalizedEmail } })
     if (existing) {
       throw new ConflictException('Email already registered')
     }
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_COST)
-    const user = await this.createUniqueUser({ email, passwordHash, nickname, isGuest: false })
+    const user = await this.createUniqueUser({
+      email: normalizedEmail,
+      passwordHash,
+      nickname,
+      isGuest: false,
+    })
     return this.mintSession(user)
   }
 
   async login(email: string, password: string): Promise<AuthSession> {
-    const user = await this.userModel.findOne({ where: { email } })
+    const user = await this.userModel.findOne({ where: { email: normalizeEmail(email) } })
     if (!user?.passwordHash) {
       throw new UnauthorizedException('Invalid credentials')
     }
@@ -100,17 +106,18 @@ export class AuthService {
   }
 
   async upgradeGuest(userId: UserId, email: string, password: string): Promise<AuthSession> {
+    const normalizedEmail = normalizeEmail(email)
     const user = await this.userModel.findByPk(userId)
     if (!user?.isGuest) {
       throw new BadRequestException('User is not a guest')
     }
 
-    const existing = await this.userModel.findOne({ where: { email } })
+    const existing = await this.userModel.findOne({ where: { email: normalizedEmail } })
     if (existing) {
       throw new ConflictException('Email already registered')
     }
 
-    user.email = email
+    user.email = normalizedEmail
     user.passwordHash = await bcrypt.hash(password, BCRYPT_COST)
     user.isGuest = false
     await this.saveUnique(user)
@@ -119,6 +126,8 @@ export class AuthService {
   }
 
   async findOrCreateOAuthUser(profile: OAuthProfileInput): Promise<AuthSession> {
+    const normalizedEmail = profile.email ? normalizeEmail(profile.email) : null
+
     const byOAuthId = await this.userModel.findOne({
       where: { oauthProvider: profile.provider, oauthId: profile.providerId },
     })
@@ -126,8 +135,8 @@ export class AuthService {
       return this.mintSession(byOAuthId)
     }
 
-    const byEmail = profile.email
-      ? await this.userModel.findOne({ where: { email: profile.email } })
+    const byEmail = normalizedEmail
+      ? await this.userModel.findOne({ where: { email: normalizedEmail } })
       : null
     if (byEmail) {
       byEmail.oauthProvider = profile.provider
@@ -137,7 +146,7 @@ export class AuthService {
     }
 
     const user = await this.createUniqueUser({
-      email: profile.email,
+      email: normalizedEmail,
       oauthProvider: profile.provider,
       oauthId: profile.providerId,
       nickname: profile.nickname,
@@ -207,6 +216,16 @@ export class AuthService {
 
     return { accessToken, refreshToken, user: toPublicUser(user) }
   }
+}
+
+/** Single normalization point for every email that gets stored or looked
+ * up (register/login/upgradeGuest/findOrCreateOAuthUser all go through
+ * this), so `A@x.com` and `a@x.com` are always treated as the same
+ * account. NOTE: this does not migrate any pre-existing mixed-case rows in
+ * the local dev database — only newly written/looked-up emails are
+ * normalized. */
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase()
 }
 
 function toPublicUser(user: User): PublicUser {

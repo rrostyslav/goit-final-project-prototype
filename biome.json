@@ -12,8 +12,7 @@
     }
   },
   "javascript": {
-    "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" },
-    "parser": { "unsafeParameterDecoratorsEnabled": true }
+    "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" }
   },
   "overrides": [
     {
@@ -22,6 +21,9 @@
         "rules": {
           "style": { "useImportType": "off" }
         }
+      },
+      "javascript": {
+        "parser": { "unsafeParameterDecoratorsEnabled": true }
       }
     }
   ]

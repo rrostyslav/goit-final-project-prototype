@@ -128,6 +128,34 @@ describe('AuthService', () => {
     ).rejects.toThrow()
   })
 
+  it('registering with a mixed-case email allows logging in with a different case', async () => {
+    const { service, userModel } = createService()
+    await service.register('User@Example.com', 'hunter22', 'Casey')
+
+    const session = await service.login('user@example.com', 'hunter22')
+
+    expect(session.user.nickname).toBe('Casey')
+    // The stored row itself is normalized too, not just the lookup path.
+    expect(userModel.rows[0]?.email).toBe('user@example.com')
+  })
+
+  it('rejects registration when the email differs only by case from an existing account', async () => {
+    const { service } = createService()
+    await service.register('a@x.com', 'hunter22', 'First')
+
+    await expect(service.register('A@X.COM', 'hunter23', 'Second')).rejects.toThrow()
+  })
+
+  it('rejects upgradeGuest when the email differs only by case from an existing account', async () => {
+    const { service } = createService()
+    await service.register('existing@example.com', 'hunter22', 'Existing')
+    const guest = await service.createGuest('NewGuest')
+
+    await expect(
+      service.upgradeGuest(guest.user.id, 'EXISTING@EXAMPLE.COM', 'hunter22'),
+    ).rejects.toThrow()
+  })
+
   it('verifyAccessToken rejects a token signed with the refresh secret', async () => {
     const { service } = createService()
     const jwt = new JwtService({})

@@ -75,6 +75,15 @@ export class AuthController {
     return this.respondWithSession(session, res)
   }
 
+  /** Only clears the `refresh_token` cookie client-side — it does not
+   * revoke the refresh JWT itself. That token stays valid server-side for
+   * its full `jwtRefreshTtl` (30d by default), so a refresh token captured
+   * before logout (e.g. via XSS or a synced device) still mints new access
+   * tokens until it naturally expires. Acceptable tradeoff for this
+   * prototype; a real fix needs either a server-side revocation blocklist
+   * (reject a token's `jti`/`sub` once logged out) or rotating
+   * refresh-token families (invalidate the whole family when a stale token
+   * in the chain is reused). */
   @Post('logout')
   @HttpCode(HttpStatus.OK)
   logout(@Res({ passthrough: true }) res: Response): { success: true } {
