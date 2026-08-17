@@ -11,7 +11,10 @@
       "suspicious": { "noExplicitAny": "error" }
     }
   },
-  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } },
+  "javascript": {
+    "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" },
+    "parser": { "unsafeParameterDecoratorsEnabled": true }
+  },
   "overrides": [
     {
       "includes": ["backend/src/**"],
