@@ -11,5 +11,15 @@
       "suspicious": { "noExplicitAny": "error" }
     }
   },
-  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } }
+  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } },
+  "overrides": [
+    {
+      "includes": ["backend/src/**"],
+      "linter": {
+        "rules": {
+          "style": { "useImportType": "off" }
+        }
+      }
+    }
+  ]
 }
