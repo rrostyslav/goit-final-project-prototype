@@ -4,11 +4,13 @@ import {
   buildTeams,
   createWordRound,
   currentExplainer,
+  currentRound,
   drawWord,
   isWordGameOver,
   pauseRound,
   resumeRound,
   scoreWord,
+  startRound,
 } from '../src/engines/word-engine'
 
 describe('word-engine', () => {
@@ -23,7 +25,7 @@ describe('word-engine', () => {
 
   it("rotates the explainer within a team across that team's turns", () => {
     let s = createWordRound(['a', 'b', 'c', 'd'], ['w1', 'w2'], {
-      totalRounds: 2,
+      totalTurns: 2,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -35,7 +37,7 @@ describe('word-engine', () => {
 
   it('scoreWord adds a point for a guess and subtracts for a skip', () => {
     let s = createWordRound(['a', 'b', 'c', 'd'], ['w1', 'w2', 'w3'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -53,7 +55,7 @@ describe('word-engine', () => {
 
   it('pause and resume preserve the remaining round time', () => {
     let s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -67,7 +69,7 @@ describe('word-engine', () => {
 
   it('never serves the same word twice within a game', () => {
     let s = createWordRound(['a', 'b'], ['w1', 'w2', 'w3'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -83,7 +85,7 @@ describe('word-engine', () => {
   // --- Additional edge-case tests beyond the brief ---
 
   it('drawWord does not crash or loop when the deck is exhausted; currentWord becomes null', () => {
-    let s = createWordRound(['a', 'b'], ['w1'], { totalRounds: 1, teamCount: 2, roundMs: 60_000 })
+    let s = createWordRound(['a', 'b'], ['w1'], { totalTurns: 1, teamCount: 2, roundMs: 60_000 })
     s = drawWord(s)
     expect(s.currentWord).toBe('w1')
     s = drawWord(s) // deck exhausted
@@ -95,7 +97,7 @@ describe('word-engine', () => {
 
   it('pausing an already-paused round is a no-op (keeps the first pausedRemainingMs)', () => {
     let s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -110,7 +112,7 @@ describe('word-engine', () => {
 
   it('resuming a round that is not paused is a no-op', () => {
     let s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -123,7 +125,7 @@ describe('word-engine', () => {
 
   it('scoreWord does not mutate the state or teams passed in', () => {
     let s = createWordRound(['a', 'b', 'c', 'd'], ['w1', 'w2'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -137,7 +139,7 @@ describe('word-engine', () => {
 
   it('advanceTurn does not mutate the state passed in', () => {
     const s = createWordRound(['a', 'b', 'c', 'd'], ['w1', 'w2'], {
-      totalRounds: 2,
+      totalTurns: 2,
       teamCount: 2,
       roundMs: 60_000,
     })
@@ -146,14 +148,100 @@ describe('word-engine', () => {
     expect(s).toEqual(before)
   })
 
-  it('isWordGameOver is true once the total rounds are exceeded', () => {
+  it('isWordGameOver is true once the total turns are exceeded', () => {
     let s = createWordRound(['a', 'b'], ['w1', 'w2'], {
-      totalRounds: 1,
+      totalTurns: 1,
       teamCount: 2,
       roundMs: 60_000,
     })
     expect(isWordGameOver(s)).toBe(false)
-    s = { ...s, round: 2 }
+    s = { ...s, turn: 2 }
     expect(isWordGameOver(s)).toBe(true)
+  })
+
+  it('a freshly-created state has never started: no deadline, nothing banked', () => {
+    const s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
+      totalTurns: 1,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    expect(s.roundEndsAt).toBeNull()
+    expect(s.pausedRemainingMs).toBeNull()
+    expect(s.roundMs).toBe(60_000)
+  })
+
+  it('a fresh (never-started) state is distinguishable from a paused one', () => {
+    const fresh = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
+      totalTurns: 1,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    let paused = startRound(fresh, 1_000_000)
+    paused = pauseRound(paused, 1_030_000)
+    // Both have roundEndsAt: null, but only the paused one has a banked value.
+    expect(fresh.roundEndsAt).toBeNull()
+    expect(fresh.pausedRemainingMs).toBeNull()
+    expect(paused.roundEndsAt).toBeNull()
+    expect(paused.pausedRemainingMs).not.toBeNull()
+  })
+
+  it('startRound sets a deadline roundMs in the future and clears any banked value', () => {
+    const s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
+      totalTurns: 1,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    const started = startRound(s, 1_000_000)
+    expect(started.roundEndsAt).toBe(1_060_000)
+    expect(started.pausedRemainingMs).toBeNull()
+  })
+
+  it('startRound does not mutate the state passed in', () => {
+    const s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
+      totalTurns: 1,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    const before = JSON.parse(JSON.stringify(s)) as typeof s
+    startRound(s, 1_000_000)
+    expect(s).toEqual(before)
+  })
+
+  it('resumeRound on a never-started state is a no-op: it does not invent a deadline', () => {
+    const fresh = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
+      totalTurns: 1,
+      teamCount: 2,
+      roundMs: 60_000,
+    })
+    expect(fresh.roundEndsAt).toBeNull()
+    expect(fresh.pausedRemainingMs).toBeNull()
+    const resumed = resumeRound(fresh, 1_000_000)
+    expect(resumed.roundEndsAt).toBeNull()
+    expect(resumed.pausedRemainingMs).toBeNull()
+  })
+
+  it('currentRound derives the 1-based cycle number from turn and team count', () => {
+    const s = createWordRound(['a', 'b', 'c', 'd'], ['w'], {
+      totalTurns: 6,
+      teamCount: 3,
+      roundMs: 60_000,
+    })
+    // 3 teams: turns 1-3 are round 1, turns 4-6 are round 2.
+    expect(currentRound({ ...s, turn: 1 })).toBe(1)
+    expect(currentRound({ ...s, turn: 3 })).toBe(1)
+    expect(currentRound({ ...s, turn: 4 })).toBe(2)
+    expect(currentRound({ ...s, turn: 6 })).toBe(2)
+    expect(currentRound({ ...s, turn: 7 })).toBe(3)
+  })
+
+  it('currentRound with a single team: every turn is its own round', () => {
+    const s = createWordRound(['a', 'b'], ['w'], {
+      totalTurns: 4,
+      teamCount: 1,
+      roundMs: 60_000,
+    })
+    expect(currentRound({ ...s, turn: 1 })).toBe(1)
+    expect(currentRound({ ...s, turn: 2 })).toBe(2)
+    expect(currentRound({ ...s, turn: 4 })).toBe(4)
   })
 })

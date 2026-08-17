@@ -11,8 +11,11 @@ export interface WordRoundState {
   activeTeamIndex: number
   /** Index into a team's memberIds of whoever explains next for that team. */
   explainerIndexByTeam: Record<string, number>
-  round: number
-  totalRounds: number
+  /** Turns taken so far (one per advanceTurn call, across all teams). Not a cycle count - see currentRound. */
+  turn: number
+  totalTurns: number
+  /** The fixed per-round time budget in ms, retained so startRound can set a deadline for turn 2, 3, ... */
+  roundMs: number
   deck: string[]
   deckCursor: number
   currentWord: string | null
@@ -45,16 +48,21 @@ export function buildTeams(players: PlayerId[], teamCount: number): TeamView[] {
 }
 
 /**
- * Builds the initial round state. The round has not started yet: roundEndsAt
- * is null, and the full `roundMs` budget is banked in pausedRemainingMs so the
- * caller starts the clock with a plain `resumeRound(state, now)` call - the
- * same primitive used to resume after a pause, so there is only one code path
- * that turns "time budget" into an actual deadline.
+ * Builds the initial round state. The clock is genuinely unset - roundEndsAt
+ * is null and pausedRemainingMs is null, not a banked value - so a fresh state
+ * is distinguishable from one paused mid-round (which has a non-null
+ * pausedRemainingMs). Call `startRound(state, now)` to actually start the
+ * clock; `resumeRound` is reserved for un-pausing a round already in progress.
+ *
+ * `totalTurns` counts individual turns (one per player who explains), not
+ * cycles through the team order: a caller who wants "N rounds where every team
+ * plays N times" passes `totalTurns: N * teamCount`. Use `currentRound(state)`
+ * to translate the turn counter back into a 1-based cycle number for display.
  */
 export function createWordRound(
   players: PlayerId[],
   deck: string[],
-  opts: { totalRounds: number; teamCount: number; roundMs: number },
+  opts: { totalTurns: number; teamCount: number; roundMs: number },
 ): WordRoundState {
   const teams = buildTeams(players, opts.teamCount)
   const explainerIndexByTeam: Record<string, number> = {}
@@ -65,13 +73,14 @@ export function createWordRound(
     teams,
     activeTeamIndex: 0,
     explainerIndexByTeam,
-    round: 1,
-    totalRounds: opts.totalRounds,
+    turn: 1,
+    totalTurns: opts.totalTurns,
+    roundMs: opts.roundMs,
     deck: [...deck],
     deckCursor: 0,
     currentWord: null,
     roundEndsAt: null,
-    pausedRemainingMs: opts.roundMs,
+    pausedRemainingMs: null,
     roundResults: [],
   }
 }
@@ -116,6 +125,21 @@ export function scoreWord(
 }
 
 /**
+ * Sets roundEndsAt to `now + state.roundMs`, starting the clock for the
+ * current turn from its full time budget. Distinct from `resumeRound`, which
+ * only ever restores a previously-banked `pausedRemainingMs` - `startRound` is
+ * the one function that turns the fixed `roundMs` budget into a fresh
+ * deadline, so it is what a caller invokes for turn 1, turn 2, and every turn
+ * after that. Starting a round that is already running (roundEndsAt is not
+ * null) overwrites the deadline with a fresh full-budget one; callers that
+ * want to avoid resetting an in-progress clock should check `roundEndsAt`
+ * first.
+ */
+export function startRound(state: WordRoundState, now: number): WordRoundState {
+  return { ...state, roundEndsAt: now + state.roundMs, pausedRemainingMs: null }
+}
+
+/**
  * Stores the time remaining until roundEndsAt and clears the deadline.
  * Pausing an already-paused round (roundEndsAt already null) is a no-op: the
  * first pause's pausedRemainingMs is kept rather than overwritten, so a
@@ -133,8 +157,16 @@ export function pauseRound(state: WordRoundState, now: number): WordRoundState {
 /**
  * Restores a deadline `pausedRemainingMs` into the future and clears the
  * banked value. Resuming a round that is already running (roundEndsAt is not
- * null) is a no-op - it does not extend or reset the existing deadline. Also
- * a no-op if there is nothing banked to resume from.
+ * null) is a no-op - it does not extend or reset the existing deadline.
+ *
+ * Also a no-op - deliberately, not by accident - if there is nothing banked
+ * to resume from (`pausedRemainingMs === null`). This covers both "already
+ * running" and "never started": a fresh state from `createWordRound` has
+ * `roundEndsAt: null` and `pausedRemainingMs: null`, which is NOT the same
+ * state as "paused" (`roundEndsAt: null`, `pausedRemainingMs` a number), so
+ * `resumeRound` does not invent a deadline for it. Use `startRound` to start
+ * a round for the first time; `resumeRound` only un-pauses one already in
+ * progress.
  */
 export function resumeRound(state: WordRoundState, now: number): WordRoundState {
   if (state.roundEndsAt !== null || state.pausedRemainingMs === null) {
@@ -146,8 +178,9 @@ export function resumeRound(state: WordRoundState, now: number): WordRoundState 
 /**
  * Moves to the next team in round-robin order and bumps the explainer index
  * of the team being left, so that team's next turn goes to a different
- * member. `round` counts turns taken (one per advanceTurn call, across all
- * teams), and isWordGameOver compares it against totalRounds.
+ * member. `turn` counts individual turns taken (one per advanceTurn call,
+ * across all teams), and isWordGameOver compares it against totalTurns. Use
+ * `currentRound(state)` to translate `turn` into a 1-based cycle number.
  */
 export function advanceTurn(state: WordRoundState): WordRoundState {
   const leavingTeam = state.teams[state.activeTeamIndex]
@@ -161,11 +194,26 @@ export function advanceTurn(state: WordRoundState): WordRoundState {
     ...state,
     activeTeamIndex,
     explainerIndexByTeam,
-    round: state.round + 1,
+    turn: state.turn + 1,
   }
 }
 
-/** True once the turn counter has moved past the configured totalRounds. */
+/** True once the turn counter has moved past the configured totalTurns. */
 export function isWordGameOver(state: WordRoundState): boolean {
-  return state.round > state.totalRounds
+  return state.turn > state.totalTurns
+}
+
+/**
+ * Derives the 1-based "round" (a full cycle through every team) that `turn`
+ * falls in, so a reducer can present "round 2 of 4" to players without
+ * recomputing the turn/team-count arithmetic itself. Turn 1..teamCount is
+ * round 1, teamCount+1..2*teamCount is round 2, and so on. A team count of
+ * zero degenerates to round 1 rather than dividing by zero.
+ */
+export function currentRound(state: WordRoundState): number {
+  const teamCount = state.teams.length
+  if (teamCount === 0) {
+    return 1
+  }
+  return Math.floor((state.turn - 1) / teamCount) + 1
 }
