@@ -88,7 +88,10 @@ export class RoomsController {
   @UseGuards(JwtAuthGuard)
   async getByCode(@Param('code') code: string): Promise<RoomDto> {
     const room = await this.roomsService.findByCode(code.toUpperCase())
-    if (!room) {
+    // A closed room's code must 404 like an unknown one — it would otherwise
+    // resolve to a stale RoomDto with an empty member list. Consistent with
+    // join(), which already refuses closed rooms via RoomClosedError.
+    if (!room || room.closedAt) {
       throw new NotFoundException('Room not found')
     }
     return this.roomsService.toDto(room.id)
@@ -170,7 +173,6 @@ export class RoomsController {
     return this.roomsService.ban(id, user.id, dto.targetId, dto.reason)
   }
 
-  /** No persistent report queue exists yet — see RoomsService.report. */
   @Post(':id/report')
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.NO_CONTENT)
@@ -179,6 +181,6 @@ export class RoomsController {
     @Param('id') id: string,
     @Body() dto: ReportRoomDto,
   ): Promise<void> {
-    return this.roomsService.report(id, user.id, dto.targetId)
+    return this.roomsService.report(id, user.id, dto.targetId, dto.reason)
   }
 }

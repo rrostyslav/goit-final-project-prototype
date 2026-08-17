@@ -12,6 +12,7 @@ import { UniqueConstraintError } from 'sequelize'
 import { Room } from '../database/models/room.model'
 import { RoomBan } from '../database/models/room-ban.model'
 import { RoomMember } from '../database/models/room-member.model'
+import { RoomReport } from '../database/models/room-report.model'
 import { User } from '../database/models/user.model'
 import { UsersService } from '../users/users.service'
 import { RoomCodeService } from './room-code.service'
@@ -67,6 +68,7 @@ export class RoomsService {
     @InjectModel(Room) private readonly roomModel: typeof Room,
     @InjectModel(RoomMember) private readonly roomMemberModel: typeof RoomMember,
     @InjectModel(RoomBan) private readonly roomBanModel: typeof RoomBan,
+    @InjectModel(RoomReport) private readonly roomReportModel: typeof RoomReport,
     @InjectModel(User) private readonly userModel: typeof User,
     private readonly usersService: UsersService,
     private readonly roomCodeService: RoomCodeService,
@@ -131,12 +133,25 @@ export class RoomsService {
       existing.isReady = false
       await existing.save()
     } else {
-      await this.roomMemberModel.create({
-        roomId,
-        userId,
-        isReady: false,
-        joinedAt: new Date(),
-      })
+      try {
+        await this.roomMemberModel.create({
+          roomId,
+          userId,
+          isReady: false,
+          joinedAt: new Date(),
+        })
+      } catch (err) {
+        if (err instanceof UniqueConstraintError) {
+          // Lost a race with a concurrent first-time join for the same
+          // (roomId, userId): the `existing` check above ran before either
+          // request had written its row, so both passed it and both reached
+          // this create(). The other request's row already exists — re-
+          // resolve to the same successful result a sequential join would
+          // have produced instead of surfacing the constraint violation.
+          return this.toDto(roomId)
+        }
+        throw err
+      }
     }
 
     return this.toDto(roomId)
@@ -205,12 +220,17 @@ export class RoomsService {
     return this.toDto(roomId)
   }
 
-  /** A room member flags another member for later moderation review. Task
-   * 5's models do not include a persistent report queue, so this validates
-   * the room and the reporter's membership and acknowledges the report; a
-   * later task can add a `RoomReport` model and wire this into a real
-   * moderation queue. */
-  async report(roomId: string, reporterId: string, targetId: string): Promise<void> {
+  /** A room member flags another member for later moderation review.
+   * Persists a `RoomReport` row. Self-reports are rejected, but reporting
+   * the same user twice in the same room is allowed on purpose — repeat
+   * offences are a moderation signal, so there is no uniqueness constraint
+   * on (room, reporter, reported user). */
+  async report(
+    roomId: string,
+    reporterId: string,
+    targetId: string,
+    reason?: string,
+  ): Promise<void> {
     await this.getRoomOrThrow(roomId)
     const reporter = await this.roomMemberModel.findOne({
       where: { roomId, userId: reporterId },
@@ -221,6 +241,16 @@ export class RoomsService {
     if (!targetId) {
       throw new BadRequestException('targetId is required')
     }
+    if (targetId === reporterId) {
+      throw new BadRequestException('You cannot report yourself')
+    }
+
+    await this.roomReportModel.create({
+      roomId,
+      reporterId,
+      reportedUserId: targetId,
+      reason: reason ?? null,
+    })
   }
 
   async browse(params: BrowseRoomsParams): Promise<RoomBrowserEntry[]> {

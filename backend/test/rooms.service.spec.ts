@@ -1,9 +1,10 @@
 import { ROOM_MAX_PLAYERS, ROOM_MIN_PLAYERS } from '@gp/shared'
-import { ForbiddenException } from '@nestjs/common'
+import { BadRequestException, ForbiddenException } from '@nestjs/common'
 import { UniqueConstraintError } from 'sequelize'
 import type { Room } from '../src/database/models/room.model'
 import type { RoomBan } from '../src/database/models/room-ban.model'
 import type { RoomMember } from '../src/database/models/room-member.model'
+import type { RoomReport } from '../src/database/models/room-report.model'
 import type { User } from '../src/database/models/user.model'
 import type { RoomCodeService } from '../src/rooms/room-code.service'
 import {
@@ -126,6 +127,11 @@ function createFakeRoomMemberModel() {
   return {
     rows,
     async create(attrs: FakeRoomMemberCreateAttrs): Promise<FakeRoomMemberRow> {
+      // Mirrors the real unique index on (room_id, user_id) — required to
+      // exercise the concurrent-join race in the "join" test below.
+      if (rows.some((r) => r.roomId === attrs.roomId && r.userId === attrs.userId)) {
+        throw new UniqueConstraintError({ message: 'Validation error' })
+      }
       counter += 1
       const row: FakeRoomMemberRow = {
         id: `member-${counter}`,
@@ -191,6 +197,43 @@ function createFakeRoomBanModel() {
   }
 }
 
+interface FakeRoomReportRow {
+  id: string
+  roomId: string
+  reporterId: string | null
+  reportedUserId: string | null
+  reason: string | null
+  createdAt: Date
+}
+
+type FakeRoomReportCreateAttrs = Partial<Omit<FakeRoomReportRow, 'id' | 'createdAt'>> & {
+  roomId: string
+}
+
+// Deliberately no uniqueness check here — reporting the same user twice in
+// the same room is allowed by design (see rooms.service.ts `report`).
+function createFakeRoomReportModel() {
+  const rows: FakeRoomReportRow[] = []
+  let counter = 0
+
+  return {
+    rows,
+    async create(attrs: FakeRoomReportCreateAttrs): Promise<FakeRoomReportRow> {
+      counter += 1
+      const row: FakeRoomReportRow = {
+        id: `report-${counter}`,
+        roomId: attrs.roomId,
+        reporterId: attrs.reporterId ?? null,
+        reportedUserId: attrs.reportedUserId ?? null,
+        reason: attrs.reason ?? null,
+        createdAt: new Date(),
+      }
+      rows.push(row)
+      return row
+    },
+  }
+}
+
 const HOST: FakeUserRow = { id: 'host-id', nickname: 'Host', avatarUrl: null, isGuest: true }
 const GUEST: FakeUserRow = { id: 'guest-id', nickname: 'Guest', avatarUrl: null, isGuest: true }
 const THIRD: FakeUserRow = { id: 'third-id', nickname: 'Third', avatarUrl: null, isGuest: true }
@@ -216,6 +259,7 @@ function createService(codeQueue: string[] = []) {
   const roomModel = createFakeRoomModel()
   const roomMemberModel = createFakeRoomMemberModel()
   const roomBanModel = createFakeRoomBanModel()
+  const roomReportModel = createFakeRoomReportModel()
   const userModel = createFakeUserModel([HOST, GUEST, THIRD])
   const usersService = new UsersService(userModel as unknown as typeof User)
   const roomCodeService = createFakeRoomCodeService(codeQueue)
@@ -224,12 +268,13 @@ function createService(codeQueue: string[] = []) {
     roomModel as unknown as typeof Room,
     roomMemberModel as unknown as typeof RoomMember,
     roomBanModel as unknown as typeof RoomBan,
+    roomReportModel as unknown as typeof RoomReport,
     userModel as unknown as typeof User,
     usersService,
     roomCodeService as unknown as RoomCodeService,
   )
 
-  return { service, roomModel, roomMemberModel, roomBanModel, roomCodeService }
+  return { service, roomModel, roomMemberModel, roomBanModel, roomReportModel, roomCodeService }
 }
 
 describe('RoomsService', () => {
@@ -360,6 +405,27 @@ describe('RoomsService', () => {
       )
       expect(rowsForGuest).toHaveLength(1)
       expect(rowsForGuest[0]?.leftAt).toBeNull()
+    })
+
+    it('two concurrent first-time joins for the same user resolve to one member row and no thrown error', async () => {
+      const { service, roomMemberModel } = createService()
+      const created = await service.create(HOST.id, { visibility: 'public', maxPlayers: 10 })
+
+      // Both calls race through the same `existing === null` check before
+      // either one writes — the fake room-member model's `create` throws a
+      // UniqueConstraintError for the loser, exactly like the real unique
+      // index on (room_id, user_id). Without the fix in `join`, this throws.
+      const [dtoA, dtoB] = await Promise.all([
+        service.join(created.id, GUEST.id),
+        service.join(created.id, GUEST.id),
+      ])
+
+      expect(dtoA.id).toBe(created.id)
+      expect(dtoB.id).toBe(created.id)
+      const rowsForGuest = roomMemberModel.rows.filter(
+        (r) => r.roomId === created.id && r.userId === GUEST.id,
+      )
+      expect(rowsForGuest).toHaveLength(1)
     })
   })
 
@@ -500,6 +566,55 @@ describe('RoomsService', () => {
 
       await expect(service.kick(created.id, GUEST.id, THIRD.id)).rejects.toThrow(ForbiddenException)
       await expect(service.ban(created.id, GUEST.id, THIRD.id)).rejects.toThrow(ForbiddenException)
+    })
+  })
+
+  describe('report', () => {
+    it('persists a report row', async () => {
+      const { service, roomReportModel } = createService()
+      const created = await service.create(HOST.id, { visibility: 'public', maxPlayers: 10 })
+      await service.join(created.id, GUEST.id)
+
+      await service.report(created.id, HOST.id, GUEST.id, 'being disruptive')
+
+      expect(roomReportModel.rows).toHaveLength(1)
+      expect(roomReportModel.rows[0]).toMatchObject({
+        roomId: created.id,
+        reporterId: HOST.id,
+        reportedUserId: GUEST.id,
+        reason: 'being disruptive',
+      })
+    })
+
+    it('allows reporting the same user twice in the same room', async () => {
+      const { service, roomReportModel } = createService()
+      const created = await service.create(HOST.id, { visibility: 'public', maxPlayers: 10 })
+      await service.join(created.id, GUEST.id)
+
+      await service.report(created.id, HOST.id, GUEST.id)
+      await service.report(created.id, HOST.id, GUEST.id)
+
+      expect(roomReportModel.rows).toHaveLength(2)
+    })
+
+    it('rejects a self-report', async () => {
+      const { service, roomReportModel } = createService()
+      const created = await service.create(HOST.id, { visibility: 'public', maxPlayers: 10 })
+
+      await expect(service.report(created.id, HOST.id, HOST.id)).rejects.toThrow(
+        BadRequestException,
+      )
+      expect(roomReportModel.rows).toHaveLength(0)
+    })
+
+    it('rejects a report filed by a non-member', async () => {
+      const { service, roomReportModel } = createService()
+      const created = await service.create(HOST.id, { visibility: 'public', maxPlayers: 10 })
+
+      await expect(service.report(created.id, GUEST.id, HOST.id)).rejects.toThrow(
+        ForbiddenException,
+      )
+      expect(roomReportModel.rows).toHaveLength(0)
     })
   })
 })

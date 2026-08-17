@@ -23,9 +23,10 @@ const restrictFk = (Sequelize, model) => ({
   onUpdate: 'CASCADE',
 })
 
-// The ban outlives the moderator's account: deleting the moderator who issued
-// it must not silently un-ban the offender, so the column is nullable and the
-// FK clears to NULL instead of cascading the delete.
+// A moderation record outlives the account it points at: deleting that
+// account (a moderator who issued a ban, or either side of a report) must
+// not silently erase or corrupt the record, so the column is nullable and
+// the FK clears to NULL instead of cascading the delete.
 const nullableSetNullFk = (Sequelize, model) => ({
   type: Sequelize.UUID,
   allowNull: true,
@@ -113,6 +114,18 @@ module.exports = {
       name: 'room_bans_room_id_user_id',
     })
 
+    // No unique index on (room_id, reporter_id, reported_user_id): reporting
+    // the same user twice in the same room is allowed on purpose — repeat
+    // offences are a moderation signal, not a duplicate to collapse.
+    await queryInterface.createTable('room_reports', {
+      id: uuidColumn(Sequelize),
+      room_id: cascadeFk(Sequelize, 'rooms'),
+      reporter_id: nullableSetNullFk(Sequelize, 'users'),
+      reported_user_id: nullableSetNullFk(Sequelize, 'users'),
+      reason: { type: Sequelize.STRING, allowNull: true },
+      created_at: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+    })
+
     await queryInterface.createTable('game_sessions', {
       id: uuidColumn(Sequelize),
       room_id: cascadeFk(Sequelize, 'rooms'),
@@ -164,6 +177,7 @@ module.exports = {
     await queryInterface.dropTable('word_deck_entries')
     await queryInterface.dropTable('game_results')
     await queryInterface.dropTable('game_sessions')
+    await queryInterface.dropTable('room_reports')
     await queryInterface.dropTable('room_bans')
     await queryInterface.dropTable('room_members')
     await queryInterface.dropTable('rooms')
