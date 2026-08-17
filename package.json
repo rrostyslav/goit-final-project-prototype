@@ -1,0 +1,20 @@
+{
+  "name": "goit-game-platform",
+  "private": true,
+  "packageManager": "pnpm@11.2.2",
+  "scripts": {
+    "build": "nx run-many -t build",
+    "test": "nx run-many -t test",
+    "typecheck": "nx run-many -t typecheck",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "dev": "nx run-many -t dev --parallel=3",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "nx": "^21.0.0",
+    "typescript": "^5.7.0"
+  }
+}

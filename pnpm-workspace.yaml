@@ -1,0 +1,6 @@
+packages:
+  - 'libs/*'
+  - 'backend'
+  - 'frontend'
+allowBuilds:
+  nx: true
