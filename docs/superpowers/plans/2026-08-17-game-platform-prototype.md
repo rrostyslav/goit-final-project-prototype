@@ -13,7 +13,7 @@
 - **Package manager is pnpm.** Never run `npm install` or `yarn`. Workspace deps use `workspace:*`.
 - **Lint/format is Biome, not ESLint/Prettier.** Do not add ESLint or Prettier to any project. Verify with `pnpm biome check .`.
 - **TypeScript strict mode on in every project.** `strict: true`, `noUncheckedIndexedAccess: true`.
-- **Dependency direction is enforced and must not be violated:** `frontend → shared`; `backend → shared, game-core`; `game-core → shared`; `shared → nothing`. `game-core` must never import NestJS, Sequelize, Redis, Socket.IO, or anything from `backend/`.
+- **Dependency direction is enforced and must not be violated:** `frontend → shared`; `backend → shared, game-core`; `game-core → shared`; `shared → nothing`. `game-core` must never import NestJS, Sequelize, Redis, Socket.IO, or anything from `backend/`. Enforcement is pnpm's isolated `node_modules`: a package can only resolve what its own `package.json` declares. So every task that adds a dependency must add it to that project's `package.json` and nowhere else — never to the root, and never to a sibling to "make the import work".
 - **Game reducers are pure.** No `Date.now()`, no `Math.random()`, no I/O inside `libs/game-core`. Time and seed arrive via context objects.
 - **Max players per room is 10** (`ROOM_MAX_PLAYERS = 10`), reconnect grace period is **45 seconds** (`RECONNECT_GRACE_MS = 45_000`). Both live in `libs/shared/src/constants.ts`.
 - **Room codes are 6 characters**, uppercase, from alphabet `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no `I`, `O`, `0`, `1`).
