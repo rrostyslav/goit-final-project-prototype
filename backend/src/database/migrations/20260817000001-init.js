@@ -13,6 +13,27 @@ const cascadeFk = (Sequelize, model) => ({
   onUpdate: 'CASCADE',
 })
 
+// A user who still hosts a room cannot be deleted out from under it (unlike
+// room-scoped children, which cascade away with the room itself).
+const restrictFk = (Sequelize, model) => ({
+  type: Sequelize.UUID,
+  allowNull: false,
+  references: { model, key: 'id' },
+  onDelete: 'RESTRICT',
+  onUpdate: 'CASCADE',
+})
+
+// The ban outlives the moderator's account: deleting the moderator who issued
+// it must not silently un-ban the offender, so the column is nullable and the
+// FK clears to NULL instead of cascading the delete.
+const nullableSetNullFk = (Sequelize, model) => ({
+  type: Sequelize.UUID,
+  allowNull: true,
+  references: { model, key: 'id' },
+  onDelete: 'SET NULL',
+  onUpdate: 'CASCADE',
+})
+
 /** @type {import('sequelize-cli').Migration} */
 module.exports = {
   async up(queryInterface, Sequelize) {
@@ -45,10 +66,15 @@ module.exports = {
         allowNull: false,
         defaultValue: 'lobby',
       },
-      host_id: cascadeFk(Sequelize, 'users'),
+      host_id: restrictFk(Sequelize, 'users'),
       max_players: { type: Sequelize.INTEGER, allowNull: false, defaultValue: 10 },
       selected_game_id: { type: Sequelize.STRING, allowNull: true },
-      invite_token: { type: Sequelize.UUID, allowNull: false, defaultValue: Sequelize.UUIDV4 },
+      invite_token: {
+        type: Sequelize.UUID,
+        allowNull: false,
+        unique: true,
+        defaultValue: Sequelize.UUIDV4,
+      },
       closed_at: { type: Sequelize.DATE, allowNull: true },
       created_at: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.NOW },
       updated_at: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.NOW },
@@ -78,7 +104,7 @@ module.exports = {
       id: uuidColumn(Sequelize),
       room_id: cascadeFk(Sequelize, 'rooms'),
       user_id: cascadeFk(Sequelize, 'users'),
-      banned_by: cascadeFk(Sequelize, 'users'),
+      banned_by: nullableSetNullFk(Sequelize, 'users'),
       reason: { type: Sequelize.STRING, allowNull: true },
       created_at: { type: Sequelize.DATE, allowNull: false, defaultValue: Sequelize.NOW },
     })

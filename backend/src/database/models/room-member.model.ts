@@ -1,3 +1,9 @@
+import type {
+  CreationOptional,
+  InferAttributes,
+  InferCreationAttributes,
+  NonAttribute,
+} from 'sequelize'
 import { BelongsTo, Column, DataType, ForeignKey, Model, Table } from 'sequelize-typescript'
 import { Room } from './room.model'
 import { User } from './user.model'
@@ -12,30 +18,33 @@ import { User } from './user.model'
   timestamps: false,
   indexes: [{ unique: true, fields: ['room_id', 'user_id'] }],
 })
-export class RoomMember extends Model<RoomMember> {
+export class RoomMember extends Model<
+  InferAttributes<RoomMember>,
+  InferCreationAttributes<RoomMember>
+> {
   @Column({ type: DataType.UUID, primaryKey: true, defaultValue: DataType.UUIDV4 })
-  declare id: string
+  declare id: CreationOptional<string>
 
   @ForeignKey(() => Room)
   @Column({ type: DataType.UUID, allowNull: false })
   declare roomId: string
 
   @BelongsTo(() => Room, 'roomId')
-  declare room?: Room
+  declare room?: NonAttribute<Room>
 
   @ForeignKey(() => User)
   @Column({ type: DataType.UUID, allowNull: false })
   declare userId: string
 
   @BelongsTo(() => User, 'userId')
-  declare user?: User
+  declare user?: NonAttribute<User>
 
   @Column({ type: DataType.BOOLEAN, allowNull: false, defaultValue: false })
-  declare isReady: boolean
+  declare isReady: CreationOptional<boolean>
 
   @Column({ type: DataType.DATE, allowNull: false, defaultValue: DataType.NOW })
-  declare joinedAt: Date
+  declare joinedAt: CreationOptional<Date>
 
   @Column({ type: DataType.DATE, allowNull: true })
-  declare leftAt: Date | null
+  declare leftAt: CreationOptional<Date | null>
 }

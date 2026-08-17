@@ -1,4 +1,5 @@
 import type { FriendshipStatus } from '@gp/shared'
+import type { CreationOptional, InferAttributes, InferCreationAttributes } from 'sequelize'
 import { Column, DataType, ForeignKey, Model, Table } from 'sequelize-typescript'
 import { User } from './user.model'
 
@@ -8,9 +9,12 @@ import { User } from './user.model'
   timestamps: false,
   indexes: [{ unique: true, fields: ['user_id', 'friend_id'] }],
 })
-export class Friendship extends Model<Friendship> {
+export class Friendship extends Model<
+  InferAttributes<Friendship>,
+  InferCreationAttributes<Friendship>
+> {
   @Column({ type: DataType.UUID, primaryKey: true, defaultValue: DataType.UUIDV4 })
-  declare id: string
+  declare id: CreationOptional<string>
 
   @ForeignKey(() => User)
   @Column({ type: DataType.UUID, allowNull: false })

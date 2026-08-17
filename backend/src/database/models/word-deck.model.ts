@@ -1,10 +1,16 @@
+import type {
+  CreationOptional,
+  InferAttributes,
+  InferCreationAttributes,
+  NonAttribute,
+} from 'sequelize'
 import { Column, DataType, HasMany, Model, Table } from 'sequelize-typescript'
 import { WordDeckEntry } from './word-deck-entry.model'
 
 @Table({ tableName: 'word_decks', underscored: true, timestamps: false })
-export class WordDeck extends Model<WordDeck> {
+export class WordDeck extends Model<InferAttributes<WordDeck>, InferCreationAttributes<WordDeck>> {
   @Column({ type: DataType.UUID, primaryKey: true, defaultValue: DataType.UUIDV4 })
-  declare id: string
+  declare id: CreationOptional<string>
 
   @Column({ type: DataType.STRING, allowNull: false })
   declare category: string
@@ -16,5 +22,5 @@ export class WordDeck extends Model<WordDeck> {
   declare name: string
 
   @HasMany(() => WordDeckEntry, 'deckId')
-  declare entries?: WordDeckEntry[]
+  declare entries?: NonAttribute<WordDeckEntry[]>
 }

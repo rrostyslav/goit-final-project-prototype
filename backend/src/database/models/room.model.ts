@@ -1,5 +1,11 @@
 import type { RoomStatus, RoomVisibility } from '@gp/shared'
 import { ROOM_MAX_PLAYERS } from '@gp/shared'
+import type {
+  CreationOptional,
+  InferAttributes,
+  InferCreationAttributes,
+  NonAttribute,
+} from 'sequelize'
 import {
   BelongsTo,
   Column,
@@ -17,9 +23,9 @@ import { User } from './user.model'
   underscored: true,
   indexes: [{ fields: ['visibility', 'status'] }],
 })
-export class Room extends Model<Room> {
+export class Room extends Model<InferAttributes<Room>, InferCreationAttributes<Room>> {
   @Column({ type: DataType.UUID, primaryKey: true, defaultValue: DataType.UUIDV4 })
-  declare id: string
+  declare id: CreationOptional<string>
 
   @Column({ type: DataType.CHAR(6), allowNull: false, unique: true })
   declare code: string
@@ -32,30 +38,30 @@ export class Room extends Model<Room> {
     allowNull: false,
     defaultValue: 'lobby',
   })
-  declare status: RoomStatus
+  declare status: CreationOptional<RoomStatus>
 
   @ForeignKey(() => User)
   @Column({ type: DataType.UUID, allowNull: false })
   declare hostId: string
 
   @BelongsTo(() => User, 'hostId')
-  declare host?: User
+  declare host?: NonAttribute<User>
 
   @Column({ type: DataType.INTEGER, allowNull: false, defaultValue: ROOM_MAX_PLAYERS })
-  declare maxPlayers: number
+  declare maxPlayers: CreationOptional<number>
 
   @Column({ type: DataType.STRING, allowNull: true })
-  declare selectedGameId: string | null
+  declare selectedGameId: CreationOptional<string | null>
 
-  @Column({ type: DataType.UUID, allowNull: false, defaultValue: DataType.UUIDV4 })
-  declare inviteToken: string
+  @Column({ type: DataType.UUID, allowNull: false, unique: true, defaultValue: DataType.UUIDV4 })
+  declare inviteToken: CreationOptional<string>
 
   @Column({ type: DataType.DATE, allowNull: true })
-  declare closedAt: Date | null
+  declare closedAt: CreationOptional<Date | null>
 
   @HasMany(() => RoomMember, 'roomId')
-  declare members?: RoomMember[]
+  declare members?: NonAttribute<RoomMember[]>
 
-  declare readonly createdAt: Date
-  declare readonly updatedAt: Date
+  declare readonly createdAt: CreationOptional<Date>
+  declare readonly updatedAt: CreationOptional<Date>
 }

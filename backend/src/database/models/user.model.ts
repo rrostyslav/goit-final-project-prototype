@@ -1,31 +1,32 @@
+import type { CreationOptional, InferAttributes, InferCreationAttributes } from 'sequelize'
 import { Column, DataType, Model, Table } from 'sequelize-typescript'
 
 @Table({ tableName: 'users', underscored: true })
-export class User extends Model<User> {
+export class User extends Model<InferAttributes<User>, InferCreationAttributes<User>> {
   @Column({ type: DataType.UUID, primaryKey: true, defaultValue: DataType.UUIDV4 })
-  declare id: string
+  declare id: CreationOptional<string>
 
   @Column({ type: DataType.STRING, allowNull: true, unique: true })
-  declare email: string | null
+  declare email: CreationOptional<string | null>
 
   @Column({ type: DataType.STRING, allowNull: true })
-  declare passwordHash: string | null
+  declare passwordHash: CreationOptional<string | null>
 
   @Column({ type: DataType.STRING, allowNull: true })
-  declare oauthProvider: string | null
+  declare oauthProvider: CreationOptional<string | null>
 
   @Column({ type: DataType.STRING, allowNull: true })
-  declare oauthId: string | null
+  declare oauthId: CreationOptional<string | null>
 
   @Column({ type: DataType.STRING, allowNull: false })
   declare nickname: string
 
   @Column({ type: DataType.STRING, allowNull: true })
-  declare avatarUrl: string | null
+  declare avatarUrl: CreationOptional<string | null>
 
   @Column({ type: DataType.BOOLEAN, allowNull: false, defaultValue: false })
-  declare isGuest: boolean
+  declare isGuest: CreationOptional<boolean>
 
-  declare readonly createdAt: Date
-  declare readonly updatedAt: Date
+  declare readonly createdAt: CreationOptional<Date>
+  declare readonly updatedAt: CreationOptional<Date>
 }
