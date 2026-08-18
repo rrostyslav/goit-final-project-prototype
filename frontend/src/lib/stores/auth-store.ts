@@ -21,6 +21,12 @@ interface AuthState extends PersistedAuthState {
   loginAsGuest: (nickname: string) => Promise<void>
   login: (email: string, password: string) => Promise<void>
   register: (email: string, password: string, nickname: string) => Promise<void>
+  /** Converts the currently signed-in guest into a full account, keeping
+   * the same user id (and therefore friends/history) rather than starting
+   * over -- see POST /auth/upgrade (backend/src/auth/auth.controller.ts).
+   * Only meaningful while `user.isGuest` is true; the backend itself
+   * rejects the call otherwise. */
+  upgrade: (email: string, password: string) => Promise<void>
   logout: () => Promise<void>
   hydrate: () => Promise<void>
   /** Not part of the public store contract used by UI code -- these exist
@@ -56,6 +62,11 @@ export const useAuthStore = create<AuthState>()(
           password,
           nickname,
         })
+        set({ user: data.user, accessToken: data.accessToken })
+      },
+
+      upgrade: async (email, password) => {
+        const data = await api.post<AuthResponse>('/auth/upgrade', { email, password })
         set({ user: data.user, accessToken: data.accessToken })
       },
 

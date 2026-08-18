@@ -49,7 +49,16 @@ export function Modal({ open, onClose, title, children, className }: ModalProps)
         aria-modal="true"
         aria-label={title}
         className={cn(
-          'w-full max-w-md rounded-2xl border border-border bg-surface p-6 shadow-xl',
+          // `relative` is load-bearing, not decorative: the backdrop button
+          // above is `position: absolute`, so without this the dialog (a
+          // plain static-positioned box) paints *underneath* it per normal
+          // CSS stacking rules (positioned elements stack above static ones
+          // regardless of DOM order) -- silently swallowing every click
+          // meant for the dialog's own content, including its own close
+          // button. `relative` gives the dialog a position too, so within
+          // the shared z-index:auto stacking context the two fall back to
+          // DOM order, where the dialog (the later sibling) wins.
+          'relative w-full max-w-md rounded-2xl border border-border bg-surface p-6 shadow-xl',
           className,
         )}
       >

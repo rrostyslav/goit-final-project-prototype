@@ -1,7 +1,11 @@
 import type { PublicUser } from '@gp/shared'
 import { useAuthStore } from './stores/auth-store'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000'
+// Exported so call sites that need a full URL rather than an api.ts request
+// -- the Google OAuth button (a plain <a>, not a fetch, since sign-in is a
+// full-page redirect handshake) -- share the same fallback instead of
+// redeclaring it.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000'
 
 export class ApiError extends Error {
   readonly status: number
@@ -28,7 +32,7 @@ interface NestErrorBody {
   error?: string
 }
 
-type HttpMethod = 'GET' | 'POST' | 'PATCH'
+type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE'
 
 // A 401 on these paths is never "your access token expired" -- /auth/refresh
 // failing means the refresh cookie itself is gone/invalid (retrying would
@@ -144,4 +148,5 @@ export const api = {
   get: <T>(path: string): Promise<T> => request<T>('GET', path, undefined, false),
   post: <T>(path: string, body?: unknown): Promise<T> => request<T>('POST', path, body, false),
   patch: <T>(path: string, body?: unknown): Promise<T> => request<T>('PATCH', path, body, false),
+  del: <T>(path: string): Promise<T> => request<T>('DELETE', path, undefined, false),
 }
