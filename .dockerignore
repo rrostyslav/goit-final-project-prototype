@@ -1,0 +1,38 @@
+# Shared by backend/Dockerfile and frontend/Dockerfile — both build with
+# the repo root as context (see each Dockerfile's top comment), so this one
+# file governs both.
+
+# Dependencies and build outputs — always reinstalled/rebuilt inside the
+# image itself; copying host copies in would also risk leaking a
+# host-specific native binary (e.g. a Linux-vs-macOS `@img/sharp-*`
+# optional dependency) into a build stage that then can't use it.
+**/node_modules
+**/dist
+**/.next
+**/coverage
+**/.nx
+**/*.tsbuildinfo
+
+# VCS and scratch — never needed inside an image, and .superpowers is task
+# scratch space per this repo's own conventions.
+.git
+.superpowers
+
+# Env files — MUST NEVER enter an image. Runtime config is injected at
+# deploy time (Kubernetes Secret/ConfigMap via charts/backend-api,
+# charts/frontend), never baked in. This excludes backend/.env,
+# frontend/.env.local, and any other .env* file anywhere in the repo.
+**/.env
+**/.env.*
+
+# Editor/OS cruft
+.DS_Store
+
+# Documentation, infra-as-config and CI definitions themselves — irrelevant
+# to either runtime image and no reason to bust the Docker layer cache when
+# only these change.
+docs
+infra
+charts
+.github
+*.md

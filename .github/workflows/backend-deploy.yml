@@ -1,0 +1,137 @@
+name: Backend deploy
+
+# infra/modules/ci-cd's OIDC trust policy only allows this role to be
+# assumed by a token whose `sub` claim is EXACTLY
+# `repo:${github_repository}:ref:refs/heads/main` (StringEquals, not a
+# wildcard — see that module's github_branch variable description). A
+# pull_request run's token has `sub = repo:<repo>:pull_request`, and a tag
+# push's token has `sub = repo:<repo>:ref:refs/tags/<tag>` — either would
+# fail `sts:AssumeRoleWithWebIdentity` outright. So this workflow can only
+# ever trigger on `push` to `main`, full stop; there is no PR/tag variant to
+# add later without a matching Terraform change first.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "libs/**"
+      - "charts/backend-api/**"
+
+# Race avoidance — this and frontend-deploy.yml can both fire off the SAME
+# push (e.g. a change under libs/** touches both). Each only ever commits
+# its own chart file (charts/backend-api/values.yaml here vs.
+# charts/frontend/values.yaml there), so they can't corrupt each other's
+# write, but they'd still be racing the SAME branch tip: whichever finishes
+# `git push origin HEAD:main` second would be pushing against a `main` its
+# local checkout no longer has as a parent, and get rejected as a
+# non-fast-forward update. Sharing one concurrency group across BOTH
+# workflow files serializes them — GitHub Actions applies `concurrency`
+# across an entire repo, not just within one workflow file, whenever the
+# group name matches — so at most one of {backend-deploy, frontend-deploy}
+# is ever mid-run at a time; the other queues instead of racing.
+# `cancel-in-progress: false` because both runs still need to fully
+# complete (each pushes a different, still-needed chart bump) — this is
+# about ordering, not about one superseding the other.
+concurrency:
+  group: deploy-main-chart-push
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required by aws-actions/configure-aws-credentials' OIDC flow
+  contents: write # required to commit the bumped image.tag back to main
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }} # matches infra/variables.tf's aws_region default
+  ECR_REPOSITORY: backend-api # matches infra/modules/ecr's `services` default list
+  PNPM_VERSION: "11.2.2"
+
+jobs:
+  build-push-deploy:
+    name: Build, push to ECR, bump chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not the default shallow depth-1 clone: the
+          # "commit the chart bump back" step below does `git pull --rebase`
+          # against `main`, which needs real history to rebase against.
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------
+      # AWS auth — OIDC only. No `aws-access-key-id` / `aws-secret-access-key`
+      # anywhere in this workflow: configure-aws-credentials exchanges the
+      # job's short-lived GitHub OIDC token for temporary AWS credentials via
+      # `sts:AssumeRoleWithWebIdentity`, scoped to exactly the role
+      # infra/modules/ci-cd/main.tf creates.
+      #
+      # `AWS_DEPLOY_ROLE_ARN` must be set as a repository (or environment)
+      # variable AFTER `terraform apply` has actually created that role —
+      # its ARN is account-specific and doesn't exist yet in this
+      # "config, no deploy" state. Left as a `vars.*` reference rather than
+      # a literal so nothing here has to change once it does.
+      # ---------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Bump charts/backend-api/values.yaml image.tag
+        uses: mikefarah/yq@v4.44.3
+        with:
+          cmd: yq -i '.image.tag = "${{ github.sha }}"' charts/backend-api/values.yaml
+
+      # ---------------------------------------------------------------
+      # Commit and push back to main — Argo CD watches this branch
+      # (infra/modules/argo_cd's gitops_branch) and syncs on the diff.
+      #
+      # Loop avoidance is TWO layers, not one:
+      #  1. `actions/checkout` persists the default GITHUB_TOKEN as this
+      #     repo's git credentials by default, so the `git push` below
+      #     authenticates as that token. GitHub Actions never starts a new
+      #     workflow run from a push made with the default GITHUB_TOKEN —
+      #     this is a hard platform rule specifically to prevent exactly
+      #     this kind of recursive trigger, and it applies regardless of
+      #     the commit message. Under this workflow's current auth, the
+      #     `[skip ci]` marker below is therefore not what's actually
+      #     preventing the loop.
+      #  2. The `[skip ci]` marker is kept anyway as defense-in-depth: the
+      #     moment this push is authenticated any other way (a PAT, a
+      #     GitHub App installation token — e.g. because branch protection
+      #     on `main` starts requiring pushes to come from something other
+      #     than the default token), rule 1 stops applying and GitHub
+      #     reverts to its normal behavior of both starting new workflow
+      #     runs AND honoring `[skip ci]`/`[ci skip]` in the head commit
+      #     message to suppress them. It also documents intent for any
+      #     human reading `git log`.
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and push image tag bump
+        run: |
+          git add charts/backend-api/values.yaml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore(backend-api): bump image tag to ${GITHUB_SHA} [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

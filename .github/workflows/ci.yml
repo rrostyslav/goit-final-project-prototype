@@ -1,0 +1,205 @@
+name: CI
+
+# Push-to-main here overlaps in trigger surface with backend-deploy.yml and
+# frontend-deploy.yml (both also fire on push to main), but never races
+# them: this workflow only ever reads the repo and never writes back to it,
+# so there's nothing here for those two to conflict with.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A second push to the same branch/PR while a run is still in flight cancels
+# the stale one — no reason to keep burning minutes validating a commit
+# that's already been superseded.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PNPM_VERSION: "11.2.2"
+  NODE_VERSION: "24"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # App workspace: lint, typecheck, unit test, build — every package in
+  # one job (matches how `nx run-many -t <target>` already fans this out
+  # locally; Nx's own dependency graph, not job splitting, is what keeps
+  # this fast).
+  # ---------------------------------------------------------------------
+  build-test:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (Biome)
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  # ---------------------------------------------------------------------
+  # Backend e2e suite: real Postgres + Redis round trips
+  # (backend/test/e2e/room-game.e2e-spec.ts), deliberately run as its own
+  # job rather than folded into `pnpm test` above.
+  #
+  # DECISION — included, not skipped, with real service containers:
+  # `pnpm test` (the "Unit tests" step above, via `nx run-many -t test`)
+  # intentionally never reaches this suite — backend/jest.config.js
+  # excludes `test/e2e/` outright and backend/package.json only wires it
+  # up under the separate `test:e2e` script. Leaving it at that would mean
+  # a meaningful slice of coverage (the realtime gateway + room/game
+  # lifecycle, exercised end-to-end against a real DB and Redis instead of
+  # mocks) never runs in CI at all. GitHub Actions service containers are
+  # the standard way to give a job exactly that — Postgres/Redis
+  # sidecars, gone once the job ends — and this repo's own
+  # backend/test/e2e/helpers.ts is already written to isolate itself into
+  # a dedicated `gameplatform_test` database and Redis logical DB 1 that
+  # it creates and migrates itself (the same `sequelize-cli db:migrate` /
+  # `db:seed:all` commands `pnpm db:migrate`/`db:seed` run in dev), so it
+  # needs nothing more from the environment than a reachable Postgres to
+  # create that database in and a reachable Redis. Verified locally
+  # against the equivalent of this job's own setup before wiring it in
+  # here — see task-27-report.md's verification section for the actual
+  # `pnpm test:e2e` output this produced.
+  #
+  # libs/shared and libs/game-core are built explicitly before the suite
+  # runs (mirroring backend/Dockerfile's own reasoning): the backend
+  # imports both as compiled CommonJS from `dist/`
+  # (`package.json`'s `"main": "dist/index.js"`), and calling
+  # `pnpm --filter backend test:e2e` directly here bypasses Nx's
+  # `dependsOn: ["^build"]` target-default that would otherwise build them
+  # automatically (that default only applies when a target is run via
+  # `nx`/`pnpm -w exec nx run-many`, not a plain `pnpm --filter` script
+  # invocation).
+  e2e:
+    name: Backend e2e (Postgres + Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: gameplatform
+          POSTGRES_PASSWORD: gameplatform
+          POSTGRES_DB: gameplatform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gameplatform"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # None of these are real credentials — they're the same
+      # committed-to-git placeholder shape .env.example already uses
+      # (dev-*-secret-change-me), scoped to this ephemeral CI job's
+      # throwaway Postgres/Redis containers only.
+      DATABASE_URL: postgres://gameplatform:gameplatform@localhost:5432/gameplatform
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-access-secret-not-a-real-credential
+      JWT_REFRESH_SECRET: ci-refresh-secret-not-a-real-credential
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_TTL: 30d
+      CORS_ORIGIN: http://localhost:3000
+      NODE_ENV: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace libs (@gp/shared, @gp/game-core)
+        run: |
+          pnpm --filter @gp/shared build
+          pnpm --filter @gp/game-core build
+
+      - name: Backend e2e tests
+        run: pnpm --filter backend test:e2e
+
+  # ---------------------------------------------------------------------
+  # Terraform: static checks only. Explicitly no `plan`/`apply`, no AWS
+  # credentials anywhere in this job — infra/README.md and this repo's
+  # own constraints call for configs, not a live deployment.
+  # ---------------------------------------------------------------------
+  terraform:
+    name: Terraform fmt & validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate
+
+  # ---------------------------------------------------------------------
+  # Helm: lint every chart. No `helm template`/install against a real
+  # cluster — same "config-only" scope as the terraform job above.
+  # ---------------------------------------------------------------------
+  helm-lint:
+    name: helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.2"
+
+      - name: helm lint charts/backend-api
+        run: helm lint charts/backend-api
+
+      - name: helm lint charts/frontend
+        run: helm lint charts/frontend
+
+      - name: helm lint charts/livekit
+        run: helm lint charts/livekit

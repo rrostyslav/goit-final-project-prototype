@@ -1,0 +1,103 @@
+name: Frontend deploy
+
+# Same shape as backend-deploy.yml — see that file's comment for the full
+# reasoning, not repeated in full here.
+#
+# Path filters mirror backend-deploy.yml's own structure one-for-one:
+# `frontend/**` (this app), `libs/**` (frontend depends on `@gp/shared` via
+# `workspace:*`, same as backend depends on `@gp/shared`/`@gp/game-core` —
+# a shared-lib change needs a frontend rebuild+redeploy too, or this image
+# silently goes stale relative to the contract it's built against), and
+# `charts/frontend/**` (this workflow's own bump target, matching
+# backend-deploy's inclusion of charts/backend-api/**).
+#
+# Same OIDC-only trust-policy constraint applies: infra/modules/ci-cd's
+# `sub` condition only matches `refs/heads/main`, so `push: branches: [main]`
+# is the only trigger this can ever have.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - "libs/**"
+      - "charts/frontend/**"
+
+# Shared group with backend-deploy.yml on purpose — see that file's comment
+# for why. This serializes the two workflows against each other repo-wide,
+# not just within this file.
+concurrency:
+  group: deploy-main-chart-push
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+  ECR_REPOSITORY: frontend # matches infra/modules/ecr's `services` default list
+  PNPM_VERSION: "11.2.2"
+
+jobs:
+  build-push-deploy:
+    name: Build, push to ECR, bump chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # ---------------------------------------------------------------
+      # NEXT_PUBLIC_API_URL / NEXT_PUBLIC_WS_URL are baked into the client
+      # bundle at THIS build step (see frontend/Dockerfile's top comment) —
+      # this image is therefore environment-specific, not portable, and
+      # this workflow only ever builds it for the one environment these
+      # two variables point at. `vars.*` (not `secrets.*`): both are public
+      # URLs the browser calls directly, the same non-secret category as
+      # charts/backend-api/values.yaml's config.corsOrigin.
+      # ---------------------------------------------------------------
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+            NEXT_PUBLIC_WS_URL=${{ vars.NEXT_PUBLIC_WS_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Bump charts/frontend/values.yaml image.tag
+        uses: mikefarah/yq@v4.44.3
+        with:
+          cmd: yq -i '.image.tag = "${{ github.sha }}"' charts/frontend/values.yaml
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and push image tag bump
+        run: |
+          git add charts/frontend/values.yaml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore(frontend): bump image tag to ${GITHUB_SHA} [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
