@@ -74,6 +74,25 @@ function sessionKey(roomId: RoomId): string {
   return `room:session:${roomId}`
 }
 
+/** Same key convention `RealtimeGateway`'s exported `lockKey` uses for every
+ * `room:*` mutation (`room:join`, `room:leave`, `room:kick`, `room:ban`,
+ * `room:transfer_host`) — duplicated here as a plain string builder rather
+ * than importing from the gateway, for the same reason `votesKey` below is
+ * duplicated rather than imported: the dependency runs gateway -> this
+ * service, not the reverse (see `GameSocketGateway`'s doc comment). Every
+ * method here that runs a load -> reduce -> persist -> broadcast sequence
+ * against a room's game state (`start`, `dispatch`, `handleTimer`,
+ * `pauseForDisconnect`, `resumeAfterReconnect`) takes this same lock, so a
+ * concurrent `game:action`/`game:start`/timer-fire/disconnect/reconnect for
+ * one room can never interleave its read and write with another's — see
+ * this task's fix report for the lost-update race this closes. The lock is
+ * acquired at exactly one level (these five entry points) and nowhere
+ * inside them, so none of them can ever nest a second acquisition of their
+ * own room's lock and stall waiting on themselves. */
+function lockKey(roomId: RoomId): string {
+  return `room:${roomId}`
+}
+
 /** Same key convention `RealtimeGateway` uses for its `votes:{roomId}` Redis
  * hash (see that file's `votesKey`) — duplicated here as a plain string
  * builder rather than importing from the gateway, to avoid a module-level
@@ -171,7 +190,17 @@ export class GameRuntimeService implements OnModuleDestroy {
   // start / dispatch / handleTimer / finish
   // -------------------------------------------------------------------
 
+  /** Locked for its ENTIRE body, not just the Redis writes at the end: two
+   * concurrent `game:start` calls for the same room (a double-click, or two
+   * hosts racing after a transfer) must not both pass the `room.status !==
+   * 'lobby'` check and both create a session — the whole
+   * check-then-create-then-persist sequence is the read-modify-write this
+   * lock protects, exactly like `dispatch` below. */
   async start(roomId: RoomId, requesterId: UserId): Promise<void> {
+    await this.redisService.withLock(lockKey(roomId), () => this.doStart(roomId, requesterId))
+  }
+
+  private async doStart(roomId: RoomId, requesterId: UserId): Promise<void> {
     await this.roomsService.assertHost(roomId, requesterId)
     const room = await this.roomsService.toDto(roomId)
 
@@ -229,7 +258,22 @@ export class GameRuntimeService implements OnModuleDestroy {
     await this.requireGateway().broadcastRoomState(roomId)
   }
 
+  /** Locked for its entire body — see `lockKey`'s doc comment. This is the
+   * fix for the review finding: two concurrent `game:action` dispatches for
+   * the same room used to each run their own unsynchronized load -> reduce
+   * -> persist -> broadcast, so the second `persistState` silently
+   * clobbered the first (both broadcast their own event, only one
+   * survived in storage). Locked, the second call's `tryLoadActiveGame`
+   * cannot run until the first call's `applyEffect` (persist included) has
+   * fully finished, so it reduces against the FIRST call's already-persisted
+   * state rather than a stale copy. */
   async dispatch(roomId: RoomId, actorId: UserId, action: GameAction): Promise<void> {
+    await this.redisService.withLock(lockKey(roomId), () =>
+      this.doDispatch(roomId, actorId, action),
+    )
+  }
+
+  private async doDispatch(roomId: RoomId, actorId: UserId, action: GameAction): Promise<void> {
     const loaded = await this.tryLoadActiveGame(roomId)
     if (!loaded) {
       await this.requireGateway().emitToUser(actorId, 'error', {
@@ -240,7 +284,7 @@ export class GameRuntimeService implements OnModuleDestroy {
     }
 
     if (loaded.actionCount >= MAX_ACTIONS_PER_SESSION) {
-      await this.finish(loaded.sessionId)
+      await this.doFinish(loaded.sessionId)
       await this.requireGateway().emitToUser(actorId, 'error', {
         code: 'session_action_limit',
         message: 'This game session hit its action limit and was ended',
@@ -271,7 +315,19 @@ export class GameRuntimeService implements OnModuleDestroy {
     await this.applyEffect(loaded, effect, 1)
   }
 
-  async handleTimer(sessionId: SessionId, timerId: string): Promise<void> {
+  /** Locked for its entire body, same as `dispatch`/`start` — a timer firing
+   * (turn clock running out) is exactly as much a read-modify-write against
+   * a room's game state as a client action is, and must be serialized
+   * against a concurrent `game:action`/`game:start` for the same room the
+   * same way. `roomId` is passed in by `applyTimers` below (captured from
+   * the `LoadedGame` that armed the timer) rather than re-derived from
+   * `sessionId` here, so picking the lock key never needs a read before the
+   * lock is held. */
+  async handleTimer(roomId: RoomId, sessionId: SessionId, timerId: string): Promise<void> {
+    await this.redisService.withLock(lockKey(roomId), () => this.doHandleTimer(sessionId, timerId))
+  }
+
+  private async doHandleTimer(sessionId: SessionId, timerId: string): Promise<void> {
     const loaded = await this.loadGame(sessionId).catch(() => null)
     // The session may already be gone (finished, or its room emptied) by
     // the time an in-flight timer actually fires — a stale timer callback
@@ -283,7 +339,19 @@ export class GameRuntimeService implements OnModuleDestroy {
     await this.applyEffect(loaded, effect)
   }
 
-  async finish(sessionId: SessionId): Promise<void> {
+  /** Private and unlocked on purpose: every path that reaches this method —
+   * `doDispatch`'s action-count guard, and `applyEffect`'s `effect.finished`
+   * branch (itself only ever called from `doDispatch`/`doHandleTimer`/
+   * `pauseForDisconnect`/`resumeAfterReconnect`) — is already running inside
+   * one of those methods' `withLock(lockKey(roomId), ...)`. Taking the same
+   * room's lock again here would be a nested acquisition of a non-reentrant
+   * mutex: `RedisService.withLock` has no notion of "the current holder is
+   * me", so it would just retry against its own still-held lock until
+   * `LOCK_ACQUIRE_TIMEOUT_MS` and then proceed anyway — a multi-second stall
+   * on every single game finish, for no correctness benefit. The lock is
+   * acquired at exactly one level (the five entry points named on `lockKey`)
+   * and this is deliberately not one of them. */
+  private async doFinish(sessionId: SessionId): Promise<void> {
     const loaded = await this.loadGame(sessionId)
     const results = loaded.definition.results(loaded.state)
 
@@ -319,7 +387,21 @@ export class GameRuntimeService implements OnModuleDestroy {
   // Disconnect / reconnect (called by presence via RealtimeGateway)
   // -------------------------------------------------------------------
 
+  /** Locked for its entire body, same as `dispatch`/`start`/`handleTimer` —
+   * `pauseForDisconnect` is its own load -> reduce -> persist -> broadcast
+   * sequence and must not interleave with a concurrent `game:action` (or
+   * another disconnect/reconnect) for the same room. Called from
+   * `RealtimeGateway.markDisconnectedIfLastSocket`, which does NOT hold
+   * `lockKey(roomId)` itself when it calls this — so acquiring it here is
+   * the only place it happens for this path, not a nested second
+   * acquisition of a lock some caller up the stack already holds. */
   async pauseForDisconnect(roomId: RoomId, userId: UserId): Promise<void> {
+    await this.redisService.withLock(lockKey(roomId), () =>
+      this.doPauseForDisconnect(roomId, userId),
+    )
+  }
+
+  private async doPauseForDisconnect(roomId: RoomId, userId: UserId): Promise<void> {
     const loaded = await this.tryLoadActiveGame(roomId)
     if (!loaded?.definition.pause) return // no active game, or nothing this game can pause
 
@@ -330,7 +412,19 @@ export class GameRuntimeService implements OnModuleDestroy {
     await this.applyEffect(loaded, effect)
   }
 
+  /** Locked for its entire body — see `pauseForDisconnect`'s doc comment.
+   * Called from `RealtimeGateway.onRoomJoin` AFTER that handler's own
+   * `withLock(lockKey(roomId), () => this.roomsService.join(...))` call has
+   * already resolved and released — not nested inside it — so acquiring the
+   * same room's lock again here is a fresh, sequential acquisition, never a
+   * re-entrant one. */
   async resumeAfterReconnect(roomId: RoomId, userId: UserId): Promise<void> {
+    await this.redisService.withLock(lockKey(roomId), () =>
+      this.doResumeAfterReconnect(roomId, userId),
+    )
+  }
+
+  private async doResumeAfterReconnect(roomId: RoomId, userId: UserId): Promise<void> {
     const loaded = await this.tryLoadActiveGame(roomId)
     if (!loaded?.definition.resume) return
 
@@ -437,7 +531,7 @@ export class GameRuntimeService implements OnModuleDestroy {
     actionCountDelta = 0,
   ): Promise<void> {
     await this.persistState(loaded, effect.state, actionCountDelta)
-    this.applyTimers(loaded.sessionId, effect.timers)
+    this.applyTimers(loaded.roomId, loaded.sessionId, effect.timers)
 
     for (const event of effect.events) {
       await this.broadcastToPlayers(loaded.playerIds, 'game:event', event)
@@ -445,7 +539,7 @@ export class GameRuntimeService implements OnModuleDestroy {
     await this.broadcastStateToPlayers(loaded.playerIds, loaded.definition, effect.state)
 
     if (effect.finished) {
-      await this.finish(loaded.sessionId)
+      await this.doFinish(loaded.sessionId)
     }
   }
 
@@ -468,12 +562,16 @@ export class GameRuntimeService implements OnModuleDestroy {
     )
   }
 
-  private applyTimers(sessionId: SessionId, timers: Effect<unknown>['timers']): void {
+  private applyTimers(
+    roomId: RoomId,
+    sessionId: SessionId,
+    timers: Effect<unknown>['timers'],
+  ): void {
     if (!timers) return
     for (const op of timers) {
       if (op.op === 'set') {
         this.gameTimerService.set(sessionId, op.id, op.delayMs ?? 0, () => {
-          this.handleTimer(sessionId, op.id).catch((err: unknown) => {
+          this.handleTimer(roomId, sessionId, op.id).catch((err: unknown) => {
             this.logger.error(`handleTimer failed for session ${sessionId}: ${errorMessage(err)}`)
           })
         })

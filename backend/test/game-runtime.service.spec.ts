@@ -131,8 +131,43 @@ function createFakeRedisClient() {
   }
 }
 
+/** A real per-key mutex, not a stub — `GameRuntimeService`'s lock fix is
+ * only actually exercised if concurrent `withLock` calls for the same key
+ * genuinely serialize here the way ioredis's `SET NX` + retry loop does in
+ * `RedisService.withLock`. Each key gets its own promise chain: a caller
+ * appends itself to the tail and only starts running `fn` once every
+ * earlier caller for that key has both run `fn` and released. This is what
+ * lets the race-repro test below actually prove something: without this
+ * behaving like a real mutex, two concurrent `dispatch` calls would just
+ * interleave in the fake exactly as they do against unlocked production
+ * code, and the "before the fix" assertion would never fail for the right
+ * reason. */
 function createFakeRedisService() {
-  return { client: createFakeRedisClient() }
+  const client = createFakeRedisClient()
+  const tails = new Map<string, Promise<unknown>>()
+  return {
+    client,
+    async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      const previousTail = tails.get(key) ?? Promise.resolve()
+      // Chains this call's `fn` after the previous caller for this key has
+      // settled (success or failure), so two overlapping `withLock` calls
+      // for the same key run their `fn`s one at a time, in call order —
+      // never interleaved.
+      const result = previousTail.then(fn, fn)
+      // The map only ever needs a "has the previous holder settled yet?"
+      // signal, not its value/error — swallow both so one caller's
+      // rejection can never leak into an unrelated caller's `fn` argument
+      // or poison the chain for the next key holder.
+      tails.set(
+        key,
+        result.then(
+          () => undefined,
+          () => undefined,
+        ),
+      )
+      return result
+    },
+  }
 }
 
 function createFakeGameTimerService() {
@@ -244,6 +279,41 @@ function wordView(payload: unknown): WordGameView {
   const view = payload as { kind: string }
   if (view.kind !== 'word') throw new Error('expected a word game view')
   return payload as WordGameView
+}
+
+/** Reaches into the raw (not `view()`-shaped) Alias state persisted by
+ * `runtime.snapshot()` to read the active team's score directly — this is
+ * deliberately the *server-authoritative* value (what actually got written
+ * to storage), not a client-facing `WordGameView`, because the race-repro
+ * test below is specifically about persisted state diverging from what was
+ * broadcast. */
+interface RawAliasState {
+  round: { teams: { id: string; score: number }[]; activeTeamIndex: number }
+}
+
+function readActiveTeamScore(state: unknown): number {
+  const { round } = state as RawAliasState
+  const team = round.teams[round.activeTeamIndex]
+  if (!team) throw new Error('expected an active team')
+  return team.score
+}
+
+interface RoundClock {
+  roundEndsAt: number | null
+  pausedRemainingMs: number | null
+}
+
+/** Reaches into the raw (not `view()`-shaped) round state for the two
+ * fields `pauseWordTurn`/`resumeWordTurn` actually toggle — used by the
+ * pause/resume tests below instead of the client-facing `WordGameView` so a
+ * "did nothing happen" assertion isn't relying on whether that particular
+ * call happened to broadcast a fresh `game:state` (a no-op path in
+ * `pauseForDisconnect`/`resumeAfterReconnect` returns before ever calling
+ * `applyEffect`, so it broadcasts nothing at all — the persisted state is
+ * the only thing left to check). */
+function readRoundClock(state: unknown): RoundClock {
+  const { round } = state as { round: RoundClock }
+  return { roundEndsAt: round.roundEndsAt, pausedRemainingMs: round.pausedRemainingMs }
 }
 
 function sessionIdFrom(gateway: { emitted: EmittedEntry[] }): string {
@@ -429,5 +499,156 @@ describe('GameRuntimeService', () => {
 
     expect(room.status).toBe('results')
     expect(gateway.emitted.some((e) => e.event === 'error' && e.userId === explainerId)).toBe(true)
+  })
+
+  // -------------------------------------------------------------------
+  // Review finding: lost update race on `game:action` (and `game:start`).
+  // Every `dispatch`/`start` call is a load -> reduce -> persist sequence;
+  // two concurrent calls for the same room must not be allowed to
+  // interleave their reads and writes, or the second persist silently
+  // overwrites the first. `createFakeRedisService`'s `withLock` above is a
+  // genuine per-key mutex (not a stub) specifically so this test proves
+  // something real about `GameRuntimeService`'s own locking, not about the
+  // fake.
+  // -------------------------------------------------------------------
+  it('two concurrent word/skip actions from the same explainer both persist their deduction', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+    const sessionId = sessionIdFrom(gateway)
+    const explainerId = currentExplainer(gateway, 'host')
+
+    await runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+    const before = readActiveTeamScore(await runtime.snapshot(sessionId))
+
+    // Fired concurrently from the SAME explainer — the reviewer's exact
+    // repro. `word/skip` is worth -1 in Alias; both calls are individually
+    // legal (both see a non-null currentWord), so both must be accepted and
+    // both must persist their own -1.
+    await Promise.all([
+      runtime.dispatch('room1', explainerId, { type: 'word/skip' }),
+      runtime.dispatch('room1', explainerId, { type: 'word/skip' }),
+    ])
+
+    // Every player gets their own `word_scored` push (`broadcastToPlayers`
+    // fans out per-player) — checking one representative client
+    // (`explainerId`) stands in for "every client", per the reviewer's
+    // repro ("broadcast two word_scored events to every client").
+    const scoredEventsForExplainer = gateway.emitted.filter(
+      (e) =>
+        e.event === 'game:event' &&
+        e.userId === explainerId &&
+        (e.payload as { type: string }).type === 'word_scored',
+    )
+    // Both actions were accepted and both broadcast `word_scored`...
+    expect(scoredEventsForExplainer).toHaveLength(2)
+
+    // ...and the server-authoritative persisted state — not just what was
+    // broadcast — must reflect BOTH deductions. Before the lock fix this
+    // reads `before - 1` (one write silently clobbered by the other): two
+    // clients told two things happened, one thing actually stored.
+    const after = readActiveTeamScore(await runtime.snapshot(sessionId))
+    expect(after).toBe(before - 2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review finding: pauseForDisconnect / resumeAfterReconnect had zero unit
+// coverage. Both are gated on `isWaitingOn(view, userId)` — the first draft
+// of `resumeAfterReconnect` ignored `userId` entirely, so ANY player's
+// reconnect would resume a round paused for someone else. That bug was
+// caught by lint and fixed, and verified live, but nothing here stopped it
+// regressing. These cases lock the gating in for both directions.
+// ---------------------------------------------------------------------------
+describe('GameRuntimeService pause/resume (disconnect/reconnect)', () => {
+  async function startedAliasRoom() {
+    const ctx = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+    await ctx.runtime.start('room1', 'host')
+    const sessionId = sessionIdFrom(ctx.gateway)
+    const explainerId = currentExplainer(ctx.gateway, 'host')
+    await ctx.runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+    const notExplainer = ['host', 'g1', 'g2', 'g3'].find((p) => p !== explainerId)
+    if (!notExplainer) throw new Error('expected a non-explainer player')
+    return { ...ctx, sessionId, explainerId, notExplainer }
+  }
+
+  it('a disconnect by the explainer the game is waiting on pauses the round', async () => {
+    const { runtime, sessionId, explainerId } = await startedAliasRoom()
+
+    const before = readRoundClock(await runtime.snapshot(sessionId))
+    expect(before.roundEndsAt).not.toBeNull()
+    expect(before.pausedRemainingMs).toBeNull()
+
+    await runtime.pauseForDisconnect('room1', explainerId)
+
+    const after = readRoundClock(await runtime.snapshot(sessionId))
+    expect(after.roundEndsAt).toBeNull()
+    expect(after.pausedRemainingMs).not.toBeNull()
+  })
+
+  it('a disconnect by a player the game is not waiting on does not pause it', async () => {
+    const { runtime, sessionId, notExplainer } = await startedAliasRoom()
+
+    const before = readRoundClock(await runtime.snapshot(sessionId))
+
+    await runtime.pauseForDisconnect('room1', notExplainer)
+
+    const after = readRoundClock(await runtime.snapshot(sessionId))
+    expect(after).toEqual(before)
+    expect(after.roundEndsAt).not.toBeNull()
+  })
+
+  it('a reconnect by the paused player resumes the round', async () => {
+    const { runtime, sessionId, explainerId } = await startedAliasRoom()
+    await runtime.pauseForDisconnect('room1', explainerId)
+    const paused = readRoundClock(await runtime.snapshot(sessionId))
+    expect(paused.roundEndsAt).toBeNull()
+
+    await runtime.resumeAfterReconnect('room1', explainerId)
+
+    const after = readRoundClock(await runtime.snapshot(sessionId))
+    expect(after.roundEndsAt).not.toBeNull()
+    expect(after.pausedRemainingMs).toBeNull()
+  })
+
+  // The regression test for the original bug: a first draft of
+  // `resumeAfterReconnect` ignored `userId`, so ANY reconnect (not just the
+  // paused explainer's own) would resume the round.
+  it('a reconnect by a different player does not resume a round paused for someone else', async () => {
+    const { runtime, sessionId, explainerId, notExplainer } = await startedAliasRoom()
+    await runtime.pauseForDisconnect('room1', explainerId)
+    const paused = readRoundClock(await runtime.snapshot(sessionId))
+    expect(paused.roundEndsAt).toBeNull()
+
+    await runtime.resumeAfterReconnect('room1', notExplainer)
+
+    const after = readRoundClock(await runtime.snapshot(sessionId))
+    expect(after.roundEndsAt).toBeNull()
+    expect(after.pausedRemainingMs).toBe(paused.pausedRemainingMs)
+  })
+
+  it('resuming a round that was never paused is a no-op and does not invent a deadline', async () => {
+    const { runtime, sessionId, explainerId } = await startedAliasRoom()
+    const before = readRoundClock(await runtime.snapshot(sessionId))
+    expect(before.roundEndsAt).not.toBeNull()
+    expect(before.pausedRemainingMs).toBeNull()
+
+    await runtime.resumeAfterReconnect('room1', explainerId)
+
+    const after = readRoundClock(await runtime.snapshot(sessionId))
+    // Same deadline, not a freshly-computed one — `resumeWordTurn` no-ops
+    // whenever there is nothing banked in `pausedRemainingMs` to restore.
+    expect(after).toEqual(before)
   })
 })
