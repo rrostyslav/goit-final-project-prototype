@@ -42,26 +42,31 @@ describe('crocodile', () => {
     expect(new Set(allMembers)).toEqual(new Set(PLAYERS))
   })
 
-  it('scores both the explainer and the guesser on a correct guess', () => {
+  it('scores both the explainer and the named guesser on a correct guess', () => {
     const def = getGameDefinition('crocodile')
     let s = start()
     const explainerId = wordView(def.view(s, 'a')).explainerId
     if (!explainerId) throw new Error('expected an explainer')
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    const guesserId = PLAYERS.find((p) => p !== explainerId)
+    if (!guesserId) throw new Error('expected a non-explainer player')
 
-    const eff = def.reduce(s, { type: 'word/correct' }, CTX(explainerId))
+    const eff = def.reduce(s, { type: 'word/correct', guesserId }, CTX(explainerId))
     const view = wordView(def.view(eff.state, explainerId))
 
     const explainerTeam = view.teams.find((t) => t.memberIds.includes(explainerId))
     if (!explainerTeam) throw new Error('expected the explainer to have a team')
     expect(explainerTeam.score).toBe(1)
 
-    const scoredOthers = view.teams.filter((t) => !t.memberIds.includes(explainerId) && t.score > 0)
-    // Exactly one other player was credited with the guess.
-    expect(scoredOthers).toHaveLength(1)
-    const guesserId = scoredOthers[0]?.memberIds[0]
-    if (!guesserId) throw new Error('expected a credited guesser')
-    expect(scoredOthers[0]?.score).toBe(1)
+    const guesserTeam = view.teams.find((t) => t.memberIds.includes(guesserId))
+    if (!guesserTeam) throw new Error('expected the guesser to have a team')
+    expect(guesserTeam.score).toBe(1)
+
+    // No other player was credited - the explainer named exactly one guesser.
+    const scoredOthers = view.teams.filter(
+      (t) => !t.memberIds.includes(explainerId) && !t.memberIds.includes(guesserId) && t.score > 0,
+    )
+    expect(scoredOthers).toHaveLength(0)
 
     const scored = wordScoredEvents(eff.events)
     expect(scored).toContainEqual({ type: 'word_scored', playerId: explainerId, guessed: true })
@@ -69,7 +74,7 @@ describe('crocodile', () => {
     expect(scored).toHaveLength(2)
   })
 
-  it('rejects word/correct from anyone but the explainer', () => {
+  it('rejects word/correct from anyone but the explainer, even with a valid guesserId', () => {
     const def = getGameDefinition('crocodile')
     let s = start()
     const explainerId = wordView(def.view(s, 'a')).explainerId
@@ -77,7 +82,59 @@ describe('crocodile', () => {
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
     const other = PLAYERS.find((p) => p !== explainerId)
     if (!other) throw new Error('expected a non-explainer player')
-    expect(() => def.reduce(s, { type: 'word/correct' }, CTX(other))).toThrow(InvalidActionError)
+    const guesserId = PLAYERS.find((p) => p !== explainerId && p !== other)
+    if (!guesserId) throw new Error('expected a second non-explainer player')
+    expect(() => def.reduce(s, { type: 'word/correct', guesserId }, CTX(other))).toThrow(
+      InvalidActionError,
+    )
+  })
+
+  it('rejects word/correct with no guesserId', () => {
+    const def = getGameDefinition('crocodile')
+    let s = start()
+    const explainerId = wordView(def.view(s, 'a')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    let caught: unknown
+    try {
+      def.reduce(s, { type: 'word/correct' }, CTX(explainerId))
+    } catch (error) {
+      caught = error
+    }
+    if (!(caught instanceof InvalidActionError)) throw new Error('expected an InvalidActionError')
+    expect(caught.code).toBe('missing_guesser')
+  })
+
+  it('rejects word/correct naming the explainer as their own guesser', () => {
+    const def = getGameDefinition('crocodile')
+    let s = start()
+    const explainerId = wordView(def.view(s, 'a')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    let caught: unknown
+    try {
+      def.reduce(s, { type: 'word/correct', guesserId: explainerId }, CTX(explainerId))
+    } catch (error) {
+      caught = error
+    }
+    if (!(caught instanceof InvalidActionError)) throw new Error('expected an InvalidActionError')
+    expect(caught.code).toBe('guesser_is_explainer')
+  })
+
+  it('rejects word/correct naming someone not in the game', () => {
+    const def = getGameDefinition('crocodile')
+    let s = start()
+    const explainerId = wordView(def.view(s, 'a')).explainerId
+    if (!explainerId) throw new Error('expected an explainer')
+    s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    let caught: unknown
+    try {
+      def.reduce(s, { type: 'word/correct', guesserId: 'ghost' }, CTX(explainerId))
+    } catch (error) {
+      caught = error
+    }
+    if (!(caught instanceof InvalidActionError)) throw new Error('expected an InvalidActionError')
+    expect(caught.code).toBe('unknown_guesser')
   })
 
   it('hides the word from every non-explainer', () => {
@@ -96,7 +153,7 @@ describe('crocodile', () => {
     }
   })
 
-  it('successive correct guesses within one turn credit a different player each time', () => {
+  it('successive correct guesses within one turn credit whichever guesser the explainer names', () => {
     const def = getGameDefinition('crocodile')
     let s = start()
     const explainerId = wordView(def.view(s, 'a')).explainerId
@@ -105,11 +162,12 @@ describe('crocodile', () => {
     const others = PLAYERS.filter((p) => p !== explainerId)
 
     const credited: string[] = []
-    for (let i = 0; i < others.length; i++) {
-      const eff = def.reduce(s, { type: 'word/correct' }, CTX(explainerId))
+    for (const guesserId of others) {
+      const eff = def.reduce(s, { type: 'word/correct', guesserId }, CTX(explainerId))
       s = eff.state
       const guessEvent = wordScoredEvents(eff.events).find((e) => e.playerId !== explainerId)
       if (!guessEvent) throw new Error('expected a guess-credit event')
+      expect(guessEvent.playerId).toBe(guesserId)
       credited.push(guessEvent.playerId)
     }
 
@@ -117,17 +175,21 @@ describe('crocodile', () => {
     expect(new Set(credited)).toEqual(new Set(others))
   })
 
-  it('a correct guess never credits the explainer as the guesser', () => {
+  it('a correct guess never credits the explainer as the guesser, across repeated named guesses', () => {
     const def = getGameDefinition('crocodile')
     let s = start()
     const explainerId = wordView(def.view(s, 'a')).explainerId
     if (!explainerId) throw new Error('expected an explainer')
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
+    const others = PLAYERS.filter((p) => p !== explainerId)
     for (let i = 0; i < 6; i++) {
-      const eff = def.reduce(s, { type: 'word/correct' }, CTX(explainerId))
+      const guesserId = others[i % others.length]
+      if (!guesserId) throw new Error('expected a non-explainer player')
+      const eff = def.reduce(s, { type: 'word/correct', guesserId }, CTX(explainerId))
       s = eff.state
       const guessEvent = wordScoredEvents(eff.events).find((e) => e.playerId !== explainerId)
       expect(guessEvent?.playerId).not.toBe(explainerId)
+      expect(guessEvent?.playerId).toBe(guesserId)
     }
   })
 
@@ -192,12 +254,12 @@ describe('crocodile', () => {
       now: 0,
     })
 
-    // Turn 1: a explains, offset 1 credits b. a:1, b:1, c:0.
+    // Turn 1: a explains and credits b with the guess. a:1, b:1, c:0.
     let explainerId = wordView(def.view(s, 'a')).explainerId
     if (!explainerId) throw new Error('expected an explainer')
     expect(explainerId).toBe('a')
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
-    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct', guesserId: 'b' }, CTX(explainerId)).state
     s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
 
     // Turn 2: b explains, no correct guesses this turn.
@@ -244,7 +306,7 @@ describe('crocodile', () => {
     let explainerId = wordView(def.view(s, 'a')).explainerId
     if (!explainerId) throw new Error('expected an explainer')
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
-    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct', guesserId: 'b' }, CTX(explainerId)).state
     s = def.reduce(s, { type: 'word/skip' }, CTX(explainerId)).state
     s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
     const afterTurn1 = wordView(def.view(s, explainerId)).lastResults
@@ -256,7 +318,7 @@ describe('crocodile', () => {
     explainerId = wordView(def.view(s, 'b')).explainerId
     if (!explainerId) throw new Error('expected an explainer')
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
-    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct', guesserId: 'a' }, CTX(explainerId)).state
     s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
     const afterTurn2 = wordView(def.view(s, explainerId)).lastResults
     expect(afterTurn2).toEqual([{ word: 'w4', guessed: true }])
@@ -267,8 +329,10 @@ describe('crocodile', () => {
     let s = start()
     const explainerId = wordView(def.view(s, 'a')).explainerId
     if (!explainerId) throw new Error('expected an explainer')
+    const guesserId = PLAYERS.find((p) => p !== explainerId)
+    if (!guesserId) throw new Error('expected a non-explainer player')
     s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId)).state
-    s = def.reduce(s, { type: 'word/correct' }, CTX(explainerId)).state
+    s = def.reduce(s, { type: 'word/correct', guesserId }, CTX(explainerId)).state
     s = def.reduce(s, { type: 'word/skip' }, CTX(explainerId)).state
     s = def.reduce(s, { type: 'word/end_round' }, CTX(explainerId)).state
     const roundTripped = JSON.parse(JSON.stringify(s))

@@ -1,24 +1,21 @@
-import {
-  type GameAction,
-  type GameEvent,
-  getGameMeta,
-  type PlayerId,
-  type WordGameView,
-} from '@gp/shared'
+import { type GameAction, getGameMeta, type PlayerId, type WordGameView } from '@gp/shared'
 import type { ActionContext, Effect, GameDefinition, GameResultRow, InitContext } from '../contract'
 import { InvalidActionError } from '../contract'
 import {
-  advanceTurn,
+  buildWordGameView,
+  clampInt,
   createWordRound,
-  currentExplainer,
   currentRound,
   drawWord,
+  finishWordTurn,
+  finiteNumberOr,
   isWordGameOver,
-  resultsForTurn,
+  requireExplainer,
   scoreTeamAt,
   scoreWord,
   startRound,
   type WordRoundState,
+  wordGameResults,
 } from '../engines/word-engine'
 
 /**
@@ -27,28 +24,24 @@ import {
  * `createWordRound` (via `buildTeams`) hands out one single-member team per
  * player instead of grouping players into real teams. `WordGameView.teams`
  * is therefore already the desired per-player scoreboard - no separate
- * mapping code is needed, see the report for why this is the chosen
- * resolution.
+ * mapping code is needed.
  *
- * `guesserOffset` is the one thing word-engine has no notion of: unlike
- * Alias/Hat, where a correct guess only ever moves the active team's own
- * score, Crocodile's correct guess pays *two* participants - the explainer
- * (the active team, scored the usual way via `scoreWord`) and whichever
- * other player is credited with the guess (a different team, scored via the
- * new `scoreTeamAt` engine primitive - see word-engine.ts). `currentWord`
- * being explainer-only is unchanged; the guess-crediting logic below is the
- * only genuinely new rule this game adds on top of the engine.
+ * Turn/timer/view/ranking machinery (`requireExplainer`, `finishWordTurn`,
+ * `buildWordGameView`, `wordGameResults`, the option clamp helpers) is
+ * shared with Alias/Hat via word-engine.ts. What is genuinely Crocodile's
+ * own rule is who a correct guess pays: unlike Alias/Hat, where a correct
+ * guess only ever moves the active team's own score, Crocodile's explainer
+ * must name a specific other player as the guesser (`word/correct`'s
+ * optional `guesserId`, see @gp/shared's GameAction), and that player's
+ * score is credited too via `scoreTeamAt` - the engine primitive that lets a
+ * scoring event pay a team other than the active one, added for this game
+ * (`scoreWord` always credits `state.activeTeamIndex`; a client cannot
+ * claim credit for an arbitrary player because `word/correct` may only be
+ * sent by the explainer, and `guesserId` is validated below against the
+ * actual players in the round before anyone is scored).
  */
 export interface CrocodileState {
   round: WordRoundState
-  /**
-   * How many teams forward of the active (explaining) team the *next*
-   * correct guess should credit, 1-based and reset to 1 every time a turn
-   * ends (see `finishTurn`). Advancing it by 1 after every correct guess
-   * means a single turn's credit rotates through every other player exactly
-   * once before repeating - see `currentGuesserIndex`.
-   */
-  guesserOffset: number
   started: boolean
   finished: boolean
 }
@@ -63,14 +56,6 @@ const MIN_ROUND_MS = 5_000
 const MAX_ROUND_MS = 600_000
 /** A correct guess pays both participants this many points; a skip costs nobody anything. */
 const POINTS = { correct: 1, skip: 0 }
-
-function clampInt(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, Math.floor(value)))
-}
-
-function finiteNumberOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
-}
 
 /**
  * Reads `options` defensively, same rationale as Alias's `parseOptions`:
@@ -91,56 +76,42 @@ function parseOptions(options: Record<string, unknown>): CrocodileOptions {
   return { totalRounds, roundMs }
 }
 
-/** Throws unless `ctx.actorId` is the player currently explaining; otherwise returns that id. */
-function requireExplainer(state: CrocodileState, ctx: ActionContext): PlayerId {
-  const explainer = currentExplainer(state.round)
-  if (explainer === null || explainer !== ctx.actorId) {
+/**
+ * Validates the `guesserId` the explainer sent with `word/correct`. Throws
+ * `InvalidActionError` - never silently ignored or defaulted - for every way
+ * the field can be wrong: absent, naming the explainer themself, or naming
+ * someone not currently in the game. A client cannot credit an arbitrary
+ * player by other means: this action may only be sent by the explainer
+ * (`requireExplainer`, enforced by the caller before this runs), and the
+ * guesser identity is only ever trusted after passing every check here.
+ *
+ * An assertion function rather than one returning a validated value so the
+ * caller's own `guesserId` narrows from `PlayerId | undefined` to `PlayerId`
+ * in place, with no second lookup needed to reuse it.
+ */
+function assertValidGuesser(
+  round: WordRoundState,
+  explainerId: PlayerId,
+  guesserId: PlayerId | undefined,
+): asserts guesserId is PlayerId {
+  if (guesserId === undefined) {
     throw new InvalidActionError(
-      'not_explainer',
-      'Only the current explainer may perform this action',
+      'missing_guesser',
+      'word/correct requires a guesserId naming who guessed the word',
     )
   }
-  return explainer
-}
-
-/**
- * The team index to credit with the *next* correct guess. The active team
- * (the explainer) is never eligible - a correct guess always pays someone
- * else - so this walks `guesserOffset` teams forward from it, wrapping
- * within the `teamCount - 1` non-explainer teams. Returns null only if there
- * are fewer than two teams (not reachable through the normal room/lobby
- * flow, which enforces this game's catalog `minPlayers: 3`, but guarded
- * anyway rather than dividing by zero).
- */
-function currentGuesserIndex(state: CrocodileState): number | null {
-  const teamCount = state.round.teams.length
-  if (teamCount < 2) return null
-  const span = teamCount - 1
-  const offset = ((state.guesserOffset - 1) % span) + 1
-  return (state.round.activeTeamIndex + offset) % teamCount
-}
-
-/**
- * Core "a turn is over" transition - identical in shape to Alias's
- * `finishTurn` (advance the word-engine turn, clear the stale word/deadline,
- * flip `finished` once the turn budget is used up) plus resetting
- * `guesserOffset` back to 1, so the next explainer's turn always starts
- * crediting the very next player in line.
- */
-function finishTurn(state: CrocodileState): Effect<CrocodileState> {
-  const endedRound = currentRound(state.round)
-  const advanced = advanceTurn(state.round)
-  const nextRound: WordRoundState = { ...advanced, currentWord: null, roundEndsAt: null }
-  const finished = isWordGameOver(nextRound)
-  const events: GameEvent[] = [{ type: 'round_ended', round: endedRound }]
-  if (finished) {
-    events.push({ type: 'game_finished' })
+  if (guesserId === explainerId) {
+    throw new InvalidActionError(
+      'guesser_is_explainer',
+      'The explainer cannot be credited as the guesser',
+    )
   }
-  return {
-    state: { ...state, round: nextRound, guesserOffset: 1, started: false, finished },
-    events,
-    timers: [{ op: 'clear', id: 'round' }],
-    finished,
+  const isCurrentPlayer = round.teams.some((team) => team.memberIds.includes(guesserId))
+  if (!isCurrentPlayer) {
+    throw new InvalidActionError(
+      'unknown_guesser',
+      'guesserId must name a player currently in the game',
+    )
   }
 }
 
@@ -156,7 +127,7 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
       teamCount,
       roundMs: options.roundMs,
     })
-    return { round, guesserOffset: 1, started: false, finished: isWordGameOver(round) }
+    return { round, started: false, finished: isWordGameOver(round) }
   },
 
   reduce(state: CrocodileState, action: GameAction, ctx: ActionContext): Effect<CrocodileState> {
@@ -166,7 +137,7 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
 
     switch (action.type) {
       case 'word/start_round': {
-        const explainer = requireExplainer(state, ctx)
+        const explainer = requireExplainer(state.round, ctx)
         if (state.started) {
           throw new InvalidActionError('already_started', 'The round is already in progress')
         }
@@ -179,22 +150,21 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
       }
 
       case 'word/correct': {
-        const explainer = requireExplainer(state, ctx)
+        const explainer = requireExplainer(state.round, ctx)
         if (!state.started) {
           throw new InvalidActionError('round_not_started', 'Call word/start_round first')
         }
         if (state.round.currentWord === null) {
           throw new InvalidActionError('no_current_word', 'No word is currently in play')
         }
-        const guesserIndex = currentGuesserIndex(state)
-        const guesserTeam = guesserIndex === null ? null : (state.round.teams[guesserIndex] ?? null)
-        const guesserId = guesserTeam?.memberIds[0] ?? null
-        if (guesserIndex === null || guesserId === null) {
-          throw new InvalidActionError(
-            'no_guesser_available',
-            'No other player is available to be credited with the guess',
-          )
-        }
+        const guesserId = action.guesserId
+        assertValidGuesser(state.round, explainer, guesserId)
+        // Crocodile's teamCount === players.length (see `init`), so every
+        // player has their own single-member team - the guesser's team
+        // index is just wherever their id turns up.
+        const guesserIndex = state.round.teams.findIndex((team) =>
+          team.memberIds.includes(guesserId),
+        )
 
         // scoreWord credits the explainer's own (active) team and records the
         // roundResults entry for this word; scoreTeamAt then credits the
@@ -205,7 +175,7 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
         round = drawWord(round)
 
         return {
-          state: { ...state, round, guesserOffset: state.guesserOffset + 1 },
+          state: { ...state, round },
           events: [
             { type: 'word_scored', playerId: explainer, guessed: true },
             { type: 'word_scored', playerId: guesserId, guessed: true },
@@ -214,7 +184,7 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
       }
 
       case 'word/skip': {
-        const explainer = requireExplainer(state, ctx)
+        const explainer = requireExplainer(state.round, ctx)
         if (!state.started) {
           throw new InvalidActionError('round_not_started', 'Call word/start_round first')
         }
@@ -229,11 +199,11 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
       }
 
       case 'word/end_round': {
-        requireExplainer(state, ctx)
+        requireExplainer(state.round, ctx)
         if (!state.started) {
           throw new InvalidActionError('round_not_started', 'The round has not started yet')
         }
-        return finishTurn(state)
+        return finishWordTurn(state)
       }
 
       default:
@@ -245,63 +215,19 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
     if (timerId !== 'round' || state.finished || !state.started) {
       return { state, events: [] }
     }
-    return finishTurn(state)
+    return finishWordTurn(state)
   },
 
   view(state: CrocodileState, viewerId: PlayerId): WordGameView {
-    const explainerId = currentExplainer(state.round)
-    const activeTeam = state.round.teams[state.round.activeTeamIndex] ?? null
-    const teamCount = Math.max(1, state.round.teams.length)
-    const phase: WordGameView['phase'] = state.finished
-      ? 'finished'
-      : state.started
-        ? 'active'
-        : state.round.turn === 1
-          ? 'preparing'
-          : 'between_rounds'
-    const maxScore = state.round.teams.reduce(
-      (max, team) => Math.max(max, team.score),
-      Number.NEGATIVE_INFINITY,
-    )
-
-    // Same "current or just-ended turn only" scoping as Alias - see its
-    // view() for the full rationale.
-    const lastResultsTurn = state.started ? state.round.turn : state.round.turn - 1
-
-    return {
-      kind: 'word',
-      gameId: 'crocodile',
-      phase,
-      round: currentRound(state.round),
-      totalRounds: state.round.totalTurns / teamCount,
-      teams: state.round.teams,
-      activeTeamId: activeTeam?.id ?? null,
-      explainerId,
-      secretWord: explainerId !== null && viewerId === explainerId ? state.round.currentWord : null,
-      roundEndsAt: state.round.roundEndsAt,
-      roundPaused: state.round.pausedRemainingMs !== null,
-      lastResults: resultsForTurn(state.round, lastResultsTurn),
-      winnerTeamIds: state.finished
-        ? state.round.teams.filter((team) => team.score === maxScore).map((team) => team.id)
-        : [],
-    }
+    return buildWordGameView(state, 'crocodile', viewerId)
   },
 
   /**
    * One player per team (see `init`), so this is plain standard competition
-   * ranking (1, 1, 3, ...) by per-player score - structurally the same
-   * ranking Alias/Hat apply to real teams, just with `memberIds` always of
-   * length 1.
+   * ranking (1, 1, 3, ...) by per-player score - see `wordGameResults` in
+   * word-engine.ts for the full rationale.
    */
   results(state: CrocodileState): GameResultRow[] {
-    const teams = state.round.teams
-    const rows: GameResultRow[] = []
-    for (const team of teams) {
-      const placement = 1 + teams.filter((other) => other.score > team.score).length
-      for (const playerId of team.memberIds) {
-        rows.push({ playerId, score: team.score, placement })
-      }
-    }
-    return rows.sort((a, b) => a.placement - b.placement)
+    return wordGameResults(state.round)
   },
 }

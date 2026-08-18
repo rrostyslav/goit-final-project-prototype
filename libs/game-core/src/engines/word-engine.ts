@@ -1,4 +1,6 @@
-import type { PlayerId, TeamView } from '@gp/shared'
+import type { GameEvent, PlayerId, TeamView, WordGameView } from '@gp/shared'
+import type { ActionContext, Effect, GameResultRow } from '../contract'
+import { InvalidActionError } from '../contract'
 
 /**
  * State for any word-guessing team game (Alias, Hat, Crocodile). Every function
@@ -6,6 +8,25 @@ import type { PlayerId, TeamView } from '@gp/shared'
  * parameters; the deck is supplied already shuffled by the caller (createRng
  * lives in ../rng.ts and is the caller's job to invoke before init).
  */
+/**
+ * Clamps `value` to the inclusive [min, max] range, flooring to an integer.
+ * Shared by every word game's option parsing (Alias/Hat's `roundMs` and
+ * `teamCount`, Crocodile's `roundMs`) so the clamping rule lives in one place.
+ */
+export function clampInt(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.floor(value)))
+}
+
+/**
+ * Reads an untrusted `options` field defensively: returns `value` only if it
+ * is actually a finite number, `fallback` otherwise. `InitContext.options` is
+ * `Record<string, unknown>` (it crosses a JSON boundary from Task 16 onward),
+ * so every word game reads it through this rather than trusting or casting.
+ */
+export function finiteNumberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
 export interface WordRoundState {
   teams: TeamView[]
   activeTeamIndex: number
@@ -101,6 +122,23 @@ export function currentExplainer(state: WordRoundState): PlayerId | null {
   }
   const explainerIndex = state.explainerIndexByTeam[team.id] ?? 0
   return team.memberIds[explainerIndex % team.memberIds.length] ?? null
+}
+
+/**
+ * Throws `InvalidActionError('not_explainer', ...)` unless `ctx.actorId` is
+ * the player currently explaining for `round`; otherwise returns that id.
+ * Shared by every word game's action handlers (Alias/Hat, Crocodile): only
+ * the current explainer may start a round, score a word, or end a turn.
+ */
+export function requireExplainer(round: WordRoundState, ctx: ActionContext): PlayerId {
+  const explainer = currentExplainer(round)
+  if (explainer === null || explainer !== ctx.actorId) {
+    throw new InvalidActionError(
+      'not_explainer',
+      'Only the current explainer may perform this action',
+    )
+  }
+  return explainer
 }
 
 /**
@@ -259,6 +297,46 @@ export function isWordGameOver(state: WordRoundState): boolean {
 }
 
 /**
+ * The slice of a word game's own state that `finishWordTurn` needs to read
+ * and update. Every word game (Alias, Hat, Crocodile) satisfies this - it is
+ * a structural constraint, not a type any game must declare against.
+ */
+export interface WordTurnState {
+  round: WordRoundState
+  started: boolean
+  finished: boolean
+}
+
+/**
+ * Core "a turn is over" transition, shared by every word game's explicit
+ * word/end_round action and its 'round' timer firing. Advances the
+ * word-engine turn (which rotates to the next team/player and bumps the
+ * leaving team's explainer index), clears the now-stale word and deadline,
+ * and flips `finished` once the engine reports the turn budget is used up.
+ *
+ * Generic over `S` so each game's own state shape (extra fields such as
+ * Alias's `mode`) passes through untouched - only `round`, `started`, and
+ * `finished` are read or overwritten.
+ */
+export function finishWordTurn<S extends WordTurnState>(state: S): Effect<S> {
+  const endedRound = currentRound(state.round)
+  const advanced = advanceTurn(state.round)
+  const nextRound: WordRoundState = { ...advanced, currentWord: null, roundEndsAt: null }
+  const finished = isWordGameOver(nextRound)
+  const events: GameEvent[] = [{ type: 'round_ended', round: endedRound }]
+  if (finished) {
+    events.push({ type: 'game_finished' })
+  }
+  const nextState = { ...state, round: nextRound, started: false, finished } as S
+  return {
+    state: nextState,
+    events,
+    timers: [{ op: 'clear', id: 'round' }],
+    finished,
+  }
+}
+
+/**
  * Derives the 1-based "round" (a full cycle through every team) that `turn`
  * falls in, so a reducer can present "round 2 of 4" to players without
  * recomputing the turn/team-count arithmetic itself. Turn 1..teamCount is
@@ -271,4 +349,78 @@ export function currentRound(state: WordRoundState): number {
     return 1
   }
   return Math.floor((state.turn - 1) / teamCount) + 1
+}
+
+/**
+ * Builds the `WordGameView` common to every word game: phase derivation,
+ * active team, the explainer-only secret word, and `lastResults` scoped to
+ * the turn that is active or that just ended (not the whole game's history -
+ * `state.round.roundResults` accumulates every word played all game;
+ * `resultsForTurn` narrows that to what a client should actually see for
+ * "the turn that just happened"). `gameId` and `viewerId` are the only
+ * per-call inputs a game supplies; everything else is read off `state.round`
+ * and the shared `started`/`finished` flags.
+ */
+export function buildWordGameView<S extends WordTurnState>(
+  state: S,
+  gameId: WordGameView['gameId'],
+  viewerId: PlayerId,
+): WordGameView {
+  const round = state.round
+  const explainerId = currentExplainer(round)
+  const activeTeam = round.teams[round.activeTeamIndex] ?? null
+  const teamCount = Math.max(1, round.teams.length)
+  const phase: WordGameView['phase'] = state.finished
+    ? 'finished'
+    : state.started
+      ? 'active'
+      : round.turn === 1
+        ? 'preparing'
+        : 'between_rounds'
+  const maxScore = round.teams.reduce(
+    (max, team) => Math.max(max, team.score),
+    Number.NEGATIVE_INFINITY,
+  )
+  const lastResultsTurn = state.started ? round.turn : round.turn - 1
+
+  return {
+    kind: 'word',
+    gameId,
+    phase,
+    round: currentRound(round),
+    totalRounds: round.totalTurns / teamCount,
+    teams: round.teams,
+    activeTeamId: activeTeam?.id ?? null,
+    explainerId,
+    secretWord: explainerId !== null && viewerId === explainerId ? round.currentWord : null,
+    roundEndsAt: round.roundEndsAt,
+    roundPaused: round.pausedRemainingMs !== null,
+    lastResults: resultsForTurn(round, lastResultsTurn),
+    winnerTeamIds: state.finished
+      ? round.teams.filter((team) => team.score === maxScore).map((team) => team.id)
+      : [],
+  }
+}
+
+/**
+ * Ranks every team in `round` by score (standard competition ranking: teams
+ * tied on score share a placement, and the next distinct score's placement
+ * equals 1 + the number of teams strictly above it - so two teams tied for
+ * first followed by a third-place team yields 1, 1, 3, not 1, 1, 2), then
+ * expands each team into one `GameResultRow` per member, all inheriting that
+ * team's score and placement. Shared by every word game: Alias/Hat rank real
+ * teams; Crocodile (one single-member team per player, see `createWordRound`
+ * called with `teamCount: players.length`) gets per-player placement for
+ * free from the same loop.
+ */
+export function wordGameResults(round: WordRoundState): GameResultRow[] {
+  const teams = round.teams
+  const rows: GameResultRow[] = []
+  for (const team of teams) {
+    const placement = 1 + teams.filter((other) => other.score > team.score).length
+    for (const playerId of team.memberIds) {
+      rows.push({ playerId, score: team.score, placement })
+    }
+  }
+  return rows.sort((a, b) => a.placement - b.placement)
 }

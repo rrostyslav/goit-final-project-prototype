@@ -1,24 +1,20 @@
-import {
-  type GameAction,
-  type GameEvent,
-  type GameMeta,
-  getGameMeta,
-  type PlayerId,
-  type WordGameView,
-} from '@gp/shared'
+import { type GameAction, type GameMeta, getGameMeta, type WordGameView } from '@gp/shared'
 import type { ActionContext, Effect, GameDefinition, GameResultRow, InitContext } from '../contract'
 import { InvalidActionError } from '../contract'
 import {
-  advanceTurn,
+  buildWordGameView,
+  clampInt,
   createWordRound,
-  currentExplainer,
   currentRound,
   drawWord,
+  finishWordTurn,
+  finiteNumberOr,
   isWordGameOver,
-  resultsForTurn,
+  requireExplainer,
   scoreWord,
   startRound,
   type WordRoundState,
+  wordGameResults,
 } from '../engines/word-engine'
 
 /**
@@ -51,14 +47,6 @@ const MIN_TEAM_COUNT = 2
  *  and at most 10 minutes (a runaway value should not be able to wedge a turn open forever). */
 const MIN_ROUND_MS = 5_000
 const MAX_ROUND_MS = 600_000
-
-function clampInt(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, Math.floor(value)))
-}
-
-function finiteNumberOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
-}
 
 /**
  * Reads `options` defensively: InitContext.options is `Record<string, unknown>`
@@ -101,42 +89,6 @@ function parseOptions(options: Record<string, unknown>, playerCount: number): Al
   return { totalRounds, roundMs, teamCount }
 }
 
-/** Throws unless `ctx.actorId` is the player currently explaining; otherwise returns that id. */
-function requireExplainer(state: AliasState, ctx: ActionContext): PlayerId {
-  const explainer = currentExplainer(state.round)
-  if (explainer === null || explainer !== ctx.actorId) {
-    throw new InvalidActionError(
-      'not_explainer',
-      'Only the current explainer may perform this action',
-    )
-  }
-  return explainer
-}
-
-/**
- * Core "a turn is over" transition, shared by the explicit word/end_round
- * action and the 'round' timer firing. Advances the word-engine turn (which
- * rotates to the next team and bumps the leaving team's explainer index),
- * clears the now-stale word and deadline, and flips `finished` once the
- * engine reports the turn budget is used up.
- */
-function finishTurn(state: AliasState): Effect<AliasState> {
-  const endedRound = currentRound(state.round)
-  const advanced = advanceTurn(state.round)
-  const nextRound: WordRoundState = { ...advanced, currentWord: null, roundEndsAt: null }
-  const finished = isWordGameOver(nextRound)
-  const events: GameEvent[] = [{ type: 'round_ended', round: endedRound }]
-  if (finished) {
-    events.push({ type: 'game_finished' })
-  }
-  return {
-    state: { ...state, round: nextRound, started: false, finished },
-    events,
-    timers: [{ op: 'clear', id: 'round' }],
-    finished,
-  }
-}
-
 /**
  * Builds the Alias/Hat game definition. Both games are the same word-engine
  * round; they differ only in what a skip is worth (`pointsForSkip`) and their
@@ -175,7 +127,7 @@ export function createAliasDefinition(
 
       switch (action.type) {
         case 'word/start_round': {
-          const explainer = requireExplainer(state, ctx)
+          const explainer = requireExplainer(state.round, ctx)
           if (state.started) {
             throw new InvalidActionError('already_started', 'The round is already in progress')
           }
@@ -189,7 +141,7 @@ export function createAliasDefinition(
 
         case 'word/correct':
         case 'word/skip': {
-          const explainer = requireExplainer(state, ctx)
+          const explainer = requireExplainer(state.round, ctx)
           if (!state.started) {
             throw new InvalidActionError('round_not_started', 'Call word/start_round first')
           }
@@ -205,11 +157,11 @@ export function createAliasDefinition(
         }
 
         case 'word/end_round': {
-          requireExplainer(state, ctx)
+          requireExplainer(state.round, ctx)
           if (!state.started) {
             throw new InvalidActionError('round_not_started', 'The round has not started yet')
           }
-          return finishTurn(state)
+          return finishWordTurn(state)
         }
 
         default:
@@ -224,73 +176,21 @@ export function createAliasDefinition(
       if (timerId !== 'round' || state.finished || !state.started) {
         return { state, events: [] }
       }
-      return finishTurn(state)
+      return finishWordTurn(state)
     },
 
-    view(state: AliasState, viewerId: PlayerId): WordGameView {
-      const explainerId = currentExplainer(state.round)
-      const activeTeam = state.round.teams[state.round.activeTeamIndex] ?? null
-      const teamCount = Math.max(1, state.round.teams.length)
-      const phase: WordGameView['phase'] = state.finished
-        ? 'finished'
-        : state.started
-          ? 'active'
-          : state.round.turn === 1
-            ? 'preparing'
-            : 'between_rounds'
-      const maxScore = state.round.teams.reduce(
-        (max, team) => Math.max(max, team.score),
-        Number.NEGATIVE_INFINITY,
-      )
-
-      // lastResults must be scoped to a single turn, not the whole game:
-      // state.round.roundResults accumulates every word played all game (kept
-      // there for history/persistence), while this view field promises "the
-      // turn that just happened" to the client. While a turn is active
-      // (started) that's the in-progress turn; once it has ended (started is
-      // false again, ahead of the next explainer starting theirs) advanceTurn
-      // has already bumped state.round.turn, so the turn that just finished
-      // is turn - 1.
-      const lastResultsTurn = state.started ? state.round.turn : state.round.turn - 1
-
-      return {
-        kind: 'word',
-        gameId: mode,
-        phase,
-        round: currentRound(state.round),
-        totalRounds: state.round.totalTurns / teamCount,
-        teams: state.round.teams,
-        activeTeamId: activeTeam?.id ?? null,
-        explainerId,
-        secretWord:
-          explainerId !== null && viewerId === explainerId ? state.round.currentWord : null,
-        roundEndsAt: state.round.roundEndsAt,
-        roundPaused: state.round.pausedRemainingMs !== null,
-        lastResults: resultsForTurn(state.round, lastResultsTurn),
-        winnerTeamIds: state.finished
-          ? state.round.teams.filter((team) => team.score === maxScore).map((team) => team.id)
-          : [],
-      }
+    view(state: AliasState, viewerId): WordGameView {
+      return buildWordGameView(state, mode, viewerId)
     },
 
     /**
-     * Ranks teams by score (standard competition ranking: teams tied on
-     * score share a placement, and the next distinct score's placement
-     * equals 1 + the number of teams strictly above it - so two teams tied
-     * for first followed by a third place team yields 1, 1, 3, not 1, 1, 2).
-     * Every member of a team inherits that team's score and placement, since
-     * GameResultRow is per player but Alias/Hat scores per team.
+     * Ranks teams by score (standard competition ranking) and expands every
+     * member into a `GameResultRow` inheriting that team's score and
+     * placement - see `wordGameResults` in word-engine.ts for the full
+     * rationale.
      */
     results(state: AliasState): GameResultRow[] {
-      const teams = state.round.teams
-      const rows: GameResultRow[] = []
-      for (const team of teams) {
-        const placement = 1 + teams.filter((other) => other.score > team.score).length
-        for (const playerId of team.memberIds) {
-          rows.push({ playerId, score: team.score, placement })
-        }
-      }
-      return rows.sort((a, b) => a.placement - b.placement)
+      return wordGameResults(state.round)
     },
   }
 }

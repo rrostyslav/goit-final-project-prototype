@@ -60,7 +60,13 @@ export type PlayerView = WordGameView | CardGameView
 
 export type GameAction =
   | { type: 'word/start_round' }
-  | { type: 'word/correct' }
+  /**
+   * `guesserId` is optional so Alias and Hat (which score the active team,
+   * not a named individual) are unaffected. Crocodile requires it: the
+   * explainer is the only one who may send this action, and `guesserId`
+   * names which other player is credited with the guess.
+   */
+  | { type: 'word/correct'; guesserId?: PlayerId }
   | { type: 'word/skip' }
   | { type: 'word/end_round' }
   | { type: 'card/attack'; card: Card }
