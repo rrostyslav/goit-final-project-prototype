@@ -2,12 +2,15 @@ import { randomUUID } from 'node:crypto'
 import type {
   Ack,
   ChatMessageDto,
+  DrawStroke,
   GameAction,
   GameId,
   PlayerId,
   PublicUser,
   RoomDto,
+  RoomId,
   ServerToClientEvents,
+  VoiceCredentials,
 } from '@gp/shared'
 import { CHAT_MAX_LENGTH, GAME_CATALOG, SOCKET_NAMESPACE } from '@gp/shared'
 import { BadRequestException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common'
@@ -29,6 +32,8 @@ import {
   RoomFullError,
   RoomsService,
 } from '../rooms/rooms.service'
+import { VoiceService } from '../voice/voice.service'
+import { DrawingService } from './drawing.service'
 import { PresenceService } from './presence.service'
 import type { AppServer, AppSocket } from './socket-user'
 
@@ -59,6 +64,8 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
     private readonly presenceService: PresenceService,
     private readonly redisService: RedisService,
     private readonly gameRuntimeService: GameRuntimeService,
+    private readonly voiceService: VoiceService,
+    private readonly drawingService: DrawingService,
   ) {}
 
   afterInit(server: AppServer): void {
@@ -164,7 +171,18 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       // genuine reconnect, funnels through here, so `resumeAfterReconnect`
       // itself must tolerate being called when there is nothing to resume.
       await this.gameRuntimeService.resumeAfterReconnect(roomId, userId)
-      return this.broadcastRoomState(roomId)
+      const dto = await this.broadcastRoomState(roomId)
+      // Task 18: catch this socket up on the Crocodile drawing channel — a
+      // per-request `draw:sync`, not a room-wide broadcast, since nobody
+      // else's canvas needs refreshing just because one more person joined.
+      // Fires for ANY running Crocodile session (not only mid-turn — see
+      // `getCrocodileDrawContext`'s doc comment), so a joiner who lands
+      // between rounds still sees whatever the previous turn already drew.
+      const drawContext = await this.gameRuntimeService.getCrocodileDrawContext(roomId)
+      if (drawContext) {
+        socket.emit('draw:sync', await this.drawingService.getAll(roomId))
+      }
+      return dto
     })
   }
 
@@ -331,8 +349,8 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
   }
 
   // ---------------------------------------------------------------------
-  // game:* handlers (Task 16) — draw:*/voice:token are Task 18's, not added
-  // here.
+  // game:* handlers (Task 16) — draw:*/voice:token are Task 18's, added in
+  // their own section below.
   // ---------------------------------------------------------------------
 
   @SubscribeMessage('game:start')
@@ -365,6 +383,111 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       await this.gameRuntimeService.dispatch(roomId, socket.data.user.id, payload.action)
       return null
     })
+  }
+
+  // ---------------------------------------------------------------------
+  // voice:* / draw:* handlers (Task 18)
+  // ---------------------------------------------------------------------
+
+  /** Issues a scoped LiveKit token for this room's voice channel.
+   * `assertMember` is the entire membership check the brief asks for — the
+   * same one every other room-scoped handler above uses — before
+   * `VoiceService.issueToken` (which has no way to check membership itself;
+   * see that method's own doc comment) is ever called. `identity` inside
+   * the issued token is `socket.data.user.id`, populated only by
+   * `authenticate` from a verified access token — never anything read off
+   * `payload`, so a caller cannot request a token for someone else's
+   * identity. */
+  @SubscribeMessage('voice:token')
+  async onVoiceToken(
+    @ConnectedSocket() socket: AppSocket,
+    @MessageBody() payload: { roomId: string },
+  ): Promise<Ack<VoiceCredentials>> {
+    return this.handle(async () => {
+      const roomId = assertNonEmptyString(payload.roomId, 'roomId')
+      this.assertMember(socket, roomId)
+      return this.voiceService.issueToken(roomId, socket.data.user)
+    })
+  }
+
+  /** No ack (see `ClientToServerEvents['draw:stroke']`) — a rejected stroke
+   * is simply never stored or broadcast, with an `error` event best-effort
+   * pushed back to the sender for feedback, mirroring how a rejected
+   * `game:action` reports through `error` rather than through this
+   * message's own (nonexistent) ack. Authorization is exactly the brief's
+   * rule: accepted ONLY from the current Crocodile explainer of a session
+   * that is actually mid-round in this room right now — not any other
+   * member, not while a different game is running, not in the lobby, and
+   * not between Crocodile rounds either (`drawContext.active` is false
+   * then: nobody has been handed the word yet, so nobody may draw). Stroke
+   * shape/bounds are `DrawingService.append`'s job (see its own doc
+   * comment for the exact limits); this handler never inspects the stroke
+   * itself beyond handing it there. */
+  @SubscribeMessage('draw:stroke')
+  async onDrawStroke(
+    @ConnectedSocket() socket: AppSocket,
+    @MessageBody() payload: { roomId: string; stroke: DrawStroke },
+  ): Promise<void> {
+    const roomId = payload.roomId
+    if (typeof roomId !== 'string' || roomId.length === 0) return
+    const actorId = socket.data.user.id
+
+    const drawContext = await this.gameRuntimeService.getCrocodileDrawContext(roomId)
+    if (!drawContext?.active || drawContext.explainerId !== actorId) {
+      await this.emitToUser(actorId, 'error', {
+        code: 'not_explainer',
+        message: 'Only the current Crocodile explainer may draw right now',
+      })
+      return
+    }
+
+    try {
+      await this.drawingService.append(roomId, payload.stroke)
+    } catch (err) {
+      await this.emitToUser(actorId, 'error', toErrorPayload(err))
+      return
+    }
+    // "Broadcast to the rest of the room" per the brief — `socket.to`
+    // excludes the sender, who already has the stroke locally.
+    socket.to(roomId).emit('draw:stroke', payload.stroke)
+  }
+
+  /** No ack, same rationale as `onDrawStroke`. Allowed for the current
+   * Crocodile explainer OR the room host (the brief's "explainer or host"),
+   * checked independently — a host who is not currently explaining may
+   * still reset a stuck/vandalized canvas. */
+  @SubscribeMessage('draw:clear')
+  async onDrawClear(
+    @ConnectedSocket() socket: AppSocket,
+    @MessageBody() payload: { roomId: string },
+  ): Promise<void> {
+    const roomId = payload.roomId
+    if (typeof roomId !== 'string' || roomId.length === 0) return
+    const actorId = socket.data.user.id
+
+    const drawContext = await this.gameRuntimeService.getCrocodileDrawContext(roomId)
+    const isExplainer = drawContext?.explainerId === actorId
+    // Short-circuits: skips the `RoomsService.toDto` round trip entirely
+    // when the explainer check alone already authorizes the request.
+    if (!isExplainer && !(await this.isRoomHost(roomId, actorId))) {
+      await this.emitToUser(actorId, 'error', {
+        code: 'forbidden',
+        message: 'Only the explainer or the host may clear the drawing',
+      })
+      return
+    }
+
+    await this.clearDrawing(roomId)
+  }
+
+  /** Part of `GameSocketGateway` (see that interface's doc comment on this
+   * method) — `GameRuntimeService` calls this directly whenever a new
+   * Crocodile round starts, and `onDrawClear` above calls it for an
+   * explicit request. Both paths converge here so "empty the log" and
+   * "tell everyone still in the room" can never drift apart. */
+  async clearDrawing(roomId: RoomId): Promise<void> {
+    await this.drawingService.clear(roomId)
+    this.server.to(roomId).emit('draw:sync', [])
   }
 
   // ---------------------------------------------------------------------
@@ -427,6 +550,21 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
   private assertMember(socket: AppSocket, roomId: string): void {
     if (!socket.rooms.has(roomId)) {
       throw new ForbiddenException('You have not joined this room')
+    }
+  }
+
+  /** Used by `onDrawClear` to grant the room host the same "clear the
+   * canvas" power as the current explainer. `false` (not thrown) when the
+   * room itself no longer exists — draw:clear has no ack to report a 404
+   * through, and "the room is gone" already implies "you may not clear its
+   * drawing," which the caller's `!isExplainer && !isHost` check already
+   * handles by simply denying. */
+  private async isRoomHost(roomId: string, userId: string): Promise<boolean> {
+    try {
+      const dto = await this.roomsService.toDto(roomId)
+      return dto.hostId === userId
+    } catch {
+      return false
     }
   }
 

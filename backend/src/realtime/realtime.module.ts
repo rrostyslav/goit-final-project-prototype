@@ -8,6 +8,8 @@ import { RedisModule } from '../redis/redis.module'
 import { RedisService } from '../redis/redis.service'
 import { RoomsModule } from '../rooms/rooms.module'
 import { RoomsService } from '../rooms/rooms.service'
+import { VoiceModule } from '../voice/voice.module'
+import { DrawingService } from './drawing.service'
 import { PresenceService } from './presence.service'
 import { lockKey, RealtimeGateway } from './realtime.gateway'
 
@@ -17,10 +19,14 @@ import { lockKey, RealtimeGateway } from './realtime.gateway'
 // Task 16: it depends on `RoomsModule` but never on `RealtimeModule`, so
 // importing it here to reach `GameRuntimeService` (both for direct
 // injection into `RealtimeGateway`, and for the `setGateway` wiring below)
-// does not create one either.
+// does not create one either. `VoiceModule` (Task 18) is standalone — it
+// only depends on `AppConfigModule` (global) — so importing it here for
+// `VoiceService` is the same non-cyclic shape again. `DrawingService`
+// (also Task 18) lives IN this module rather than its own, since
+// `RealtimeGateway` is its only consumer.
 @Module({
-  imports: [AuthModule, RedisModule, RoomsModule, NotificationsModule, GamesModule],
-  providers: [RealtimeGateway, PresenceService],
+  imports: [AuthModule, RedisModule, RoomsModule, NotificationsModule, GamesModule, VoiceModule],
+  providers: [RealtimeGateway, PresenceService, DrawingService],
   exports: [RealtimeGateway, PresenceService],
 })
 export class RealtimeModule implements OnModuleInit {

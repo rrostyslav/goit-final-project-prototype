@@ -194,8 +194,10 @@ interface EmittedEntry {
 
 function createStubGateway() {
   const emitted: EmittedEntry[] = []
+  const clearDrawingCalls: string[] = []
   return {
     emitted,
+    clearDrawingCalls,
     async emitToUser<E extends keyof ServerToClientEvents>(
       userId: string,
       event: E,
@@ -216,6 +218,12 @@ function createStubGateway() {
         members: [],
         createdAt: new Date(0).toISOString(),
       }
+    },
+    // Task 18's hook — see `GameSocketGateway.clearDrawing`'s doc comment.
+    // Tracked in its own array (not `emitted`) so this addition cannot
+    // perturb any pre-existing assertion that iterates `gateway.emitted`.
+    async clearDrawing(roomId: string): Promise<void> {
+      clearDrawingCalls.push(roomId)
     },
   }
 }
@@ -413,6 +421,45 @@ describe('GameRuntimeService', () => {
     expect(words.filter(Boolean)).toHaveLength(1)
     const explainerView = afterStart.find((e) => e.userId === explainerId)
     expect(wordView(explainerView?.payload).secretWord).toBeTruthy()
+  })
+
+  it('clears the drawing channel via the gateway whenever a Crocodile round starts', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+
+    await runtime.start('room1', 'host')
+    expect(gateway.clearDrawingCalls).toHaveLength(0)
+
+    const explainerId = currentExplainer(gateway, 'host')
+    await runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+    expect(gateway.clearDrawingCalls).toEqual(['room1'])
+
+    // A later action that does NOT start a new round (word/correct requires
+    // a guesserId here, so use word/skip instead) must not clear the
+    // channel again — only `round_started` does.
+    await runtime.dispatch('room1', explainerId, { type: 'word/skip' })
+    expect(gateway.clearDrawingCalls).toEqual(['room1'])
+  })
+
+  it('never clears the drawing channel for a non-Crocodile word game', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+
+    await runtime.start('room1', 'host')
+    const explainerId = currentExplainer(gateway, 'host')
+    await runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+
+    expect(gateway.clearDrawingCalls).toHaveLength(0)
   })
 
   it('an invalid action emits error to the actor and leaves state unchanged', async () => {
@@ -650,5 +697,87 @@ describe('GameRuntimeService pause/resume (disconnect/reconnect)', () => {
     // Same deadline, not a freshly-computed one — `resumeWordTurn` no-ops
     // whenever there is nothing banked in `pausedRemainingMs` to restore.
     expect(after).toEqual(before)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getCrocodileDrawContext — Task 18's one hook into this service for the
+// drawing channel: who (if anyone) is authorized to draw right now, and
+// whether a joiner should be caught up via `draw:sync`. See that method's
+// own doc comment for the full contract.
+// ---------------------------------------------------------------------------
+describe('GameRuntimeService.getCrocodileDrawContext', () => {
+  it('returns null when no game is running in the room', async () => {
+    const { runtime } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+
+    expect(await runtime.getCrocodileDrawContext('room1')).toBeNull()
+  })
+
+  it('returns null while a different game is running', async () => {
+    const { runtime } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+
+    expect(await runtime.getCrocodileDrawContext('room1')).toBeNull()
+  })
+
+  it('reports active: false with the current (non-drawing) explainer before a round starts', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+    const explainerId = currentExplainer(gateway, 'host')
+
+    const ctx = await runtime.getCrocodileDrawContext('room1')
+    expect(ctx).toEqual({ active: false, explainerId })
+  })
+
+  it('reports active: true with the explainer once a round has started', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+    const explainerId = currentExplainer(gateway, 'host')
+    await runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+
+    const ctx = await runtime.getCrocodileDrawContext('room1')
+    expect(ctx).toEqual({ active: true, explainerId })
+  })
+
+  it('the explainer changes after a turn ends, and the context reflects it', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+    const firstExplainer = currentExplainer(gateway, 'host')
+    await runtime.dispatch('room1', firstExplainer, { type: 'word/start_round' })
+    await runtime.dispatch('room1', firstExplainer, { type: 'word/end_round' })
+
+    const ctx = await runtime.getCrocodileDrawContext('room1')
+    expect(ctx?.active).toBe(false)
+    expect(ctx?.explainerId).not.toBe(firstExplainer)
   })
 })

@@ -150,6 +150,15 @@ export interface GameSocketGateway {
     payload: Parameters<ServerToClientEvents[E]>[0],
   ): Promise<void>
   broadcastRoomState(roomId: RoomId): Promise<RoomDto>
+  /** Empties `roomId`'s drawing log and broadcasts `draw:sync` with `[]` to
+   * everyone still in the room — called below whenever a Crocodile round
+   * starts (see `applyEffect`'s `round_started` handling), so the next
+   * explainer's canvas starts blank for every viewer, not just future
+   * joiners. Implemented by `RealtimeGateway` (Task 18), which owns both the
+   * `DrawingService` this delegates to and the socket broadcast — kept off
+   * this service on purpose: drawing strokes are deliberately outside the
+   * reducer/game-state this file owns (see Task 18's report). */
+  clearDrawing(roomId: RoomId): Promise<void>
 }
 
 /**
@@ -473,6 +482,36 @@ export class GameRuntimeService implements OnModuleDestroy {
     return loaded.state
   }
 
+  /** Task 18's one hook into this service's session state: tells
+   * `RealtimeGateway` whether `roomId` currently has a running Crocodile
+   * session and, if so, who is explaining right now — the entire
+   * authorization boundary for `draw:stroke` (only the returned
+   * `explainerId`, and only while `active` is true) and the trigger for
+   * `draw:sync` on `room:join` (any non-null result, active or not: a
+   * between-rounds/preparing joiner should still catch up on strokes drawn
+   * so far, even though nobody may draw again until the round becomes
+   * active). Returns `null` for "no Crocodile session is running in this
+   * room" — no session at all, a different game, or the session already
+   * finished — which covers every one of the brief's "not accepted" cases
+   * (not a member of an active session, another game running, still in the
+   * lobby) in one check: none of those states ever produces a `LoadedGame`
+   * with `gameId === 'crocodile'` here.
+   *
+   * `explainerId` on a word view is visible to every viewer (unlike
+   * `secretWord`, which is masked per-player — see `buildWordGameView`), so
+   * this can safely read it off any one of `loaded.playerIds`' own view
+   * rather than needing the specific caller's id. */
+  async getCrocodileDrawContext(
+    roomId: RoomId,
+  ): Promise<{ active: boolean; explainerId: PlayerId | null } | null> {
+    const loaded = await this.tryLoadActiveGame(roomId)
+    if (loaded?.gameId !== 'crocodile') return null
+    const anyPlayerId = loaded.playerIds[0] ?? SYSTEM_ACTOR
+    const view = loaded.definition.view(loaded.state, anyPlayerId)
+    if (view.kind !== 'word') return null
+    return { active: view.phase === 'active', explainerId: view.explainerId }
+  }
+
   onModuleDestroy(): void {
     for (const timer of this.lobbyReturnTimers.values()) {
       clearTimeout(timer)
@@ -535,6 +574,15 @@ export class GameRuntimeService implements OnModuleDestroy {
 
     for (const event of effect.events) {
       await this.broadcastToPlayers(loaded.playerIds, 'game:event', event)
+      // Task 18's drawing channel is deliberately outside this reducer's own
+      // state (see `GameSocketGateway.clearDrawing`'s doc comment) — a new
+      // Crocodile turn starting is the one moment that channel must be
+      // wiped for every viewer, not just future joiners, so the next
+      // explainer starts on a blank canvas rather than the previous
+      // explainer's leftover lines.
+      if (loaded.gameId === 'crocodile' && event.type === 'round_started') {
+        await this.requireGateway().clearDrawing(loaded.roomId)
+      }
     }
     await this.broadcastStateToPlayers(loaded.playerIds, loaded.definition, effect.state)
 
