@@ -2,6 +2,7 @@ import type {
   Ack,
   ChatMessageDto,
   ClientToServerEvents,
+  DrawStroke,
   GameAction,
   GameEvent,
   GameId,
@@ -41,6 +42,21 @@ interface RoomState {
   notifications: NotificationDto[]
   gameId: GameId | null
   sessionId: string | null
+  /** Crocodile's drawing log for the room's current game, in the order
+   * strokes were drawn -- a full replace on `draw:sync` (initial catch-up on
+   * join, and the empty-array broadcast a clear or a fresh round produces),
+   * an append on every incoming `draw:stroke`. Reset when a new game starts
+   * (see `game:started` below) so a leftover drawing never bleeds into the
+   * next session before the first `draw:sync` of that session arrives. */
+  strokes: DrawStroke[]
+  /** The most recent `error` event pushed to this socket -- almost always a
+   * rejected `game:action` (an `InvalidActionError` the reducer threw; see
+   * `RealtimeGateway.onGameAction`'s doc comment for why that never surfaces
+   * through `game:action`'s own ack) or a rejected `draw:stroke`/`draw:clear`
+   * authorization check. Task 22's word-game screens are the intended
+   * consumer -- see `clearGameError` for how a screen dismisses a stale one
+   * once it has shown it. */
+  gameError: { code: string; message: string } | null
   /** Live Socket.IO transport state -- distinct from LiveKit's own
    * connection state (see use-voice.ts), tracked here so any room-page UI
    * can show a "reconnecting..." banner independent of voice. */
@@ -63,6 +79,22 @@ interface RoomState {
   transferHost: (userId: PlayerId) => Promise<void>
   requestVoiceToken: (roomId: RoomId) => Promise<VoiceCredentials>
   clearKicked: () => void
+  /** Fire-and-forget, like the wire event itself (`ClientToServerEvents`'s
+   * `draw:stroke` takes no ack) -- appends optimistically to `strokes` so
+   * the drawing explainer's own canvas has a single source of truth (the
+   * store) to redraw from on resize, exactly like every other client's,
+   * since the server's broadcast deliberately excludes the sender (see
+   * `RealtimeGateway.onDrawStroke`'s `socket.to(roomId)`, not `.to`). */
+  sendStroke: (stroke: DrawStroke) => void
+  /** Also fire-and-forget. Never applied optimistically -- unlike
+   * `sendStroke`, a rejected `draw:clear` (rate-limited, or neither the
+   * explainer nor the host) must not show a cleared canvas that the server
+   * never actually cleared; this waits for the room-wide `draw:sync` the
+   * server broadcasts once the clear actually happens (see
+   * `RealtimeGateway.clearDrawing`), the same way every other viewer's
+   * canvas clears. */
+  clearDrawing: () => void
+  clearGameError: () => void
 }
 
 const initialState = {
@@ -75,6 +107,8 @@ const initialState = {
   notifications: [],
   gameId: null,
   sessionId: null,
+  strokes: [],
+  gameError: null,
   socketConnected: false,
   joinError: null,
   kickedReason: null,
@@ -93,6 +127,9 @@ const initialState = {
   | 'transferHost'
   | 'requestVoiceToken'
   | 'clearKicked'
+  | 'sendStroke'
+  | 'clearDrawing'
+  | 'clearGameError'
 >
 
 // ---------------------------------------------------------------------------
@@ -218,7 +255,21 @@ function attachListeners(s: AppSocket): void {
     })),
   )
   s.on('game:started', ({ gameId, sessionId }) =>
-    useRoomStore.setState({ gameId, sessionId, view: null, standings: null }),
+    // `strokes`/`gameError` reset here too: a leftover drawing or a stale
+    // rejection from the PREVIOUS game in this room must never bleed into
+    // the next one. For Crocodile specifically the server also clears the
+    // drawing log itself on the first `word/start_round` (see
+    // `GameRuntimeService.applyEffect`'s `round_started` handling) and
+    // broadcasts a fresh `draw:sync` then -- this reset just covers the
+    // window between `game:started` and that first round actually starting.
+    useRoomStore.setState({
+      gameId,
+      sessionId,
+      view: null,
+      standings: null,
+      strokes: [],
+      gameError: null,
+    }),
   )
   s.on('game:state', (view) => useRoomStore.setState({ view }))
   s.on('game:event', (event) =>
@@ -231,13 +282,21 @@ function attachListeners(s: AppSocket): void {
       notifications: [...state.notifications, notification].slice(-MAX_NOTIFICATIONS),
     })),
   )
+  // Task 18's Crocodile drawing channel: `draw:sync` is a full replace (the
+  // catch-up a joining/reconnecting socket receives, and the empty-array
+  // broadcast `RealtimeGateway.clearDrawing` sends on an explicit clear or a
+  // fresh round), `draw:stroke` is an incremental append for everyone
+  // EXCEPT the sender (who already drew it locally -- see `sendStroke`).
+  s.on('draw:sync', (strokes) => useRoomStore.setState({ strokes }))
+  s.on('draw:stroke', (stroke) =>
+    useRoomStore.setState((state) => ({ strokes: [...state.strokes, stroke] })),
+  )
   // Room-scoped write rejections with no ack to report through (rate
   // limits, `draw:*`/`game:action` authorization failures -- see those
-  // handlers' own doc comments in realtime.gateway.ts) surface here.
-  // Nothing in this task's UI consumes these yet -- Task 22/23's game
-  // screens are the real audience -- so this only guards against an
-  // unhandled 'error' listener taking the whole app down.
-  s.on('error', () => {})
+  // handlers' own doc comments in realtime.gateway.ts) surface here. Task
+  // 22's word-game screens read `gameError` off the store to show the last
+  // one -- see `clearGameError` for how a screen dismisses it again.
+  s.on('error', (payload) => useRoomStore.setState({ gameError: payload }))
 }
 
 /** Review finding (Task 21 fix-up): recovers from a rejected handshake, or
@@ -410,6 +469,21 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   clearKicked: () => set({ kickedReason: null }),
+
+  sendStroke: (stroke) => {
+    const roomId = requireRoomId(get)
+    const s = ensureSocket()
+    s.emit('draw:stroke', { roomId, stroke })
+    set((state) => ({ strokes: [...state.strokes, stroke] }))
+  },
+
+  clearDrawing: () => {
+    const roomId = requireRoomId(get)
+    const s = ensureSocket()
+    s.emit('draw:clear', { roomId })
+  },
+
+  clearGameError: () => set({ gameError: null }),
 }))
 
 function requireRoomId(get: () => RoomState): RoomId {

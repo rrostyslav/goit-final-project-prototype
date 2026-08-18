@@ -5,6 +5,8 @@ import { getGameMeta, ROOM_CODE_LENGTH } from '@gp/shared'
 import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 import { type ReactNode, useEffect, useState } from 'react'
+import { CrocodileScreen } from '@/components/games/crocodile/crocodile-screen'
+import { WordGameScreen } from '@/components/games/word/word-game-screen'
 import { SiteHeader } from '@/components/layout/site-header'
 import { ChatPanel } from '@/components/room/chat-panel'
 import { Lobby } from '@/components/room/lobby'
@@ -43,6 +45,7 @@ export default function RoomPage() {
   const room = useRoomStore((s) => s.room)
   const standings = useRoomStore((s) => s.standings)
   const gameId = useRoomStore((s) => s.gameId)
+  const view = useRoomStore((s) => s.view)
   const kickedReason = useRoomStore((s) => s.kickedReason)
   const socketConnected = useRoomStore((s) => s.socketConnected)
   const join = useRoomStore((s) => s.join)
@@ -173,7 +176,22 @@ export default function RoomPage() {
   if (room.status === 'lobby') {
     mainArea = <Lobby />
   } else if (room.status === 'in_game') {
-    mainArea = <InGamePlaceholder gameId={gameId} />
+    // `view` arrives over the socket a moment after `room:state` reports
+    // `in_game` (see `GameRuntimeService.doStart`'s broadcast order) and is
+    // `null` again for the instant between a finished game's last
+    // `game:state` and `game:ended` -- both render the loading placeholder
+    // rather than crash. `view.kind === 'card'` (Durak/Nine) is Task 23's
+    // screens, not built yet, so it falls through to the same placeholder.
+    mainArea =
+      view?.kind === 'word' ? (
+        view.gameId === 'crocodile' ? (
+          <CrocodileScreen view={view} />
+        ) : (
+          <WordGameScreen view={view} />
+        )
+      ) : (
+        <InGamePlaceholder gameId={gameId} />
+      )
   } else {
     mainArea = <ResultsScreen room={room} standings={standings} />
   }
@@ -233,11 +251,15 @@ function LoadingShell() {
   )
 }
 
-/** Task 22/23 replace this with the real per-game screens, driven by
- * `useRoomStore`'s `view`/`sendAction`. The room's `status` transitions
- * themselves (`lobby -> in_game -> results -> lobby`) are entirely
- * server-driven (see game-runtime.service.ts) -- this placeholder never
- * invents a client-side timer or otherwise tries to drive them. */
+/** Task 22 replaced this with the real screens for the three word games
+ * (Alias/Hat/Crocodile, `view.kind === 'word'` -- see `WordGameScreen`/
+ * `CrocodileScreen` above). This placeholder now only covers what is left:
+ * the two card games (Durak/Nine, Task 23's screens, not built yet) and the
+ * brief window before `view` itself has arrived (see the `mainArea`
+ * branch above). The room's `status` transitions themselves
+ * (`lobby -> in_game -> results -> lobby`) are entirely server-driven (see
+ * game-runtime.service.ts) -- this placeholder never invents a client-side
+ * timer or otherwise tries to drive them. */
 function InGamePlaceholder({ gameId }: { gameId: GameId | null }) {
   const { t } = useI18n()
   return (
