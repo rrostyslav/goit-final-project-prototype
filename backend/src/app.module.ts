@@ -3,6 +3,7 @@ import { AuthModule } from './auth/auth.module'
 import { AppConfigModule } from './config/config.module'
 import { DatabaseModule } from './database/database.module'
 import { FriendsModule } from './friends/friends.module'
+import { GamesModule } from './games/games.module'
 import { HealthModule } from './health/health.module'
 import { NotificationsModule } from './notifications/notifications.module'
 import { RealtimeModule } from './realtime/realtime.module'
@@ -19,6 +20,7 @@ import { UsersModule } from './users/users.module'
     FriendsModule,
     NotificationsModule,
     RoomsModule,
+    GamesModule,
     RealtimeModule,
   ],
 })

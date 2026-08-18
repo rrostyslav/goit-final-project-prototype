@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type {
   Ack,
   ChatMessageDto,
+  GameAction,
   GameId,
   PlayerId,
   PublicUser,
@@ -20,6 +21,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets'
 import { AuthService } from '../auth/auth.service'
+import { GameRuntimeService } from '../games/game-runtime.service'
 import { RedisService } from '../redis/redis.service'
 import {
   RoomBannedError,
@@ -56,6 +58,7 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
     private readonly roomsService: RoomsService,
     private readonly presenceService: PresenceService,
     private readonly redisService: RedisService,
+    private readonly gameRuntimeService: GameRuntimeService,
   ) {}
 
   afterInit(server: AppServer): void {
@@ -156,6 +159,11 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       )
       await socket.join(roomId)
       this.presenceService.markOnline(roomId, userId, socket.id)
+      // A safe no-op when nothing was actually paused for this user (see
+      // `resumeWordTurn`'s own no-op conditions) — every join, not just a
+      // genuine reconnect, funnels through here, so `resumeAfterReconnect`
+      // itself must tolerate being called when there is nothing to resume.
+      await this.gameRuntimeService.resumeAfterReconnect(roomId, userId)
       return this.broadcastRoomState(roomId)
     })
   }
@@ -323,6 +331,43 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
   }
 
   // ---------------------------------------------------------------------
+  // game:* handlers (Task 16) — draw:*/voice:token are Task 18's, not added
+  // here.
+  // ---------------------------------------------------------------------
+
+  @SubscribeMessage('game:start')
+  async onGameStart(
+    @ConnectedSocket() socket: AppSocket,
+    @MessageBody() payload: { roomId: string },
+  ): Promise<Ack<null>> {
+    return this.handle(async () => {
+      const roomId = assertNonEmptyString(payload.roomId, 'roomId')
+      this.assertMember(socket, roomId)
+      await this.gameRuntimeService.start(roomId, socket.data.user.id)
+      return null
+    })
+  }
+
+  /** Unlike every handler above, a rejected in-game action does not surface
+   * through this ack: `GameRuntimeService.dispatch` converts a reducer's
+   * `InvalidActionError` into an `error` event pushed to the acting socket
+   * directly (see that method), and always resolves normally here — the ack
+   * only ever reports a genuine plumbing failure (e.g. this socket is not a
+   * member of the room). */
+  @SubscribeMessage('game:action')
+  async onGameAction(
+    @ConnectedSocket() socket: AppSocket,
+    @MessageBody() payload: { roomId: string; action: GameAction },
+  ): Promise<Ack<null>> {
+    return this.handle(async () => {
+      const roomId = assertNonEmptyString(payload.roomId, 'roomId')
+      this.assertMember(socket, roomId)
+      await this.gameRuntimeService.dispatch(roomId, socket.data.user.id, payload.action)
+      return null
+    })
+  }
+
+  // ---------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------
 
@@ -368,6 +413,10 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
     )
     if (!stillPresent) {
       this.presenceService.markDisconnected(roomId, userId)
+      // Only actually pauses anything if this user is who an active game is
+      // currently waiting on (see `GameRuntimeService.pauseForDisconnect` /
+      // `isWaitingOn`) — otherwise a no-op, same as every other disconnect.
+      await this.gameRuntimeService.pauseForDisconnect(roomId, userId)
       await this.broadcastRoomState(roomId)
     }
   }
@@ -428,6 +477,11 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
     const dto = await this.broadcastRoomState(roomId)
     if (dto.members.length === 0) {
       await this.clearVotes(roomId)
+      // A room that empties must not leave anything Task 16 owns lingering
+      // behind: a pending results -> lobby timer, or an active session's
+      // in-process timers and Redis state (see
+      // `GameRuntimeService.handleRoomEmptied`).
+      await this.gameRuntimeService.handleRoomEmptied(roomId)
     }
     const votes = await this.getVotes(roomId)
     this.server.to(roomId).emit('room:votes', votes)

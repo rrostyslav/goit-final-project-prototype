@@ -337,6 +337,60 @@ export function finishWordTurn<S extends WordTurnState>(state: S): Effect<S> {
 }
 
 /**
+ * Freezes the active turn's clock for `pause`/`resume` (Task 16's
+ * `GameRuntimeService.pauseForDisconnect`/`resumeAfterReconnect`, called when
+ * the current explainer disconnects). A no-op — new object, same values —
+ * when there is no running turn to freeze (`!state.started`, already
+ * `finished`, or `pauseRound` itself finds nothing running): pausing a turn
+ * that was never started or has already ended must never invent a deadline
+ * or double-count a clear. Emits `timers: [{ op: 'clear', id: 'round' }]`
+ * unconditionally when a turn is running so the caller's in-process timer for
+ * this session is cancelled alongside the state's own `pausedRemainingMs`
+ * bookkeeping — otherwise the original timer would still fire mid-pause.
+ */
+export function pauseWordTurn<S extends WordTurnState>(state: S, now: number): Effect<S> {
+  if (!state.started || state.finished) {
+    return { state: { ...state }, events: [] }
+  }
+  const round = pauseRound(state.round, now)
+  return {
+    state: { ...state, round },
+    events: [],
+    timers: [{ op: 'clear', id: 'round' }],
+  }
+}
+
+/**
+ * Restores the clock frozen by `pauseWordTurn`. Also a no-op under the same
+ * conditions (`!state.started`, `finished`), and additionally whenever
+ * `resumeRound` itself has nothing banked to restore (never paused in the
+ * first place) — in which case no fresh timer is set either, since there is
+ * no new deadline to fire against. When a deadline *is* restored, re-arms
+ * the caller's 'round' timer for exactly the remaining time, so a turn
+ * paused with 10s left still gets exactly 10s after the reconnect, not a
+ * fresh full `roundMs` budget.
+ */
+export function resumeWordTurn<S extends WordTurnState>(state: S, now: number): Effect<S> {
+  // The `pausedRemainingMs === null` check (not just `!started`/`finished`)
+  // is what makes this a true no-op for a round that is currently running
+  // (never paused): `resumeRound` itself would also no-op in that case, but
+  // only checking its output would still emit a spurious `timers: [{op:
+  // 'set', ...}]` re-arming an already-correct timer for no reason.
+  if (!state.started || state.finished || state.round.pausedRemainingMs === null) {
+    return { state: { ...state }, events: [] }
+  }
+  const round = resumeRound(state.round, now)
+  if (round.roundEndsAt === null) {
+    return { state: { ...state, round }, events: [] }
+  }
+  return {
+    state: { ...state, round },
+    events: [],
+    timers: [{ op: 'set', id: 'round', delayMs: round.roundEndsAt - now }],
+  }
+}
+
+/**
  * Derives the 1-based "round" (a full cycle through every team) that `turn`
  * falls in, so a reducer can present "round 2 of 4" to players without
  * recomputing the turn/team-count arithmetic itself. Turn 1..teamCount is

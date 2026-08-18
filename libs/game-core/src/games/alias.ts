@@ -10,7 +10,9 @@ import {
   finishWordTurn,
   finiteNumberOr,
   isWordGameOver,
+  pauseWordTurn,
   requireExplainer,
+  resumeWordTurn,
   scoreWord,
   startRound,
   type WordRoundState,
@@ -181,6 +183,14 @@ export function createAliasDefinition(
 
     view(state: AliasState, viewerId): WordGameView {
       return buildWordGameView(state, mode, viewerId)
+    },
+
+    pause(state: AliasState, now: number): Effect<AliasState> {
+      return pauseWordTurn(state, now)
+    },
+
+    resume(state: AliasState, now: number): Effect<AliasState> {
+      return resumeWordTurn(state, now)
     },
 
     /**

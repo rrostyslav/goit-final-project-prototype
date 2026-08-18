@@ -10,7 +10,9 @@ import {
   finishWordTurn,
   finiteNumberOr,
   isWordGameOver,
+  pauseWordTurn,
   requireExplainer,
+  resumeWordTurn,
   scoreTeamAt,
   scoreWord,
   startRound,
@@ -220,6 +222,14 @@ export const crocodileDefinition: GameDefinition<CrocodileState, GameAction> = {
 
   view(state: CrocodileState, viewerId: PlayerId): WordGameView {
     return buildWordGameView(state, 'crocodile', viewerId)
+  },
+
+  pause(state: CrocodileState, now: number): Effect<CrocodileState> {
+    return pauseWordTurn(state, now)
+  },
+
+  resume(state: CrocodileState, now: number): Effect<CrocodileState> {
+    return resumeWordTurn(state, now)
   },
 
   /**

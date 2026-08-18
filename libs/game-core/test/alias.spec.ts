@@ -418,4 +418,47 @@ describe('alias / hat', () => {
     const serialized = JSON.stringify(def.view(s, other))
     expect(serialized.includes(secretWord)).toBe(false)
   })
+
+  describe('pause / resume (Task 16 disconnect handling)', () => {
+    it('pause freezes the round clock and clears the round timer; resume restores it for the remaining time', () => {
+      const def = getGameDefinition('alias')
+      if (!def.pause || !def.resume) throw new Error('expected alias to implement pause/resume')
+      let s = start()
+      const explainerId = wordView(def.view(s, 'a')).explainerId
+      if (!explainerId) throw new Error('expected an explainer')
+      s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId, 1_000)).state
+      expect(wordView(def.view(s, explainerId)).roundEndsAt).toBe(61_000)
+
+      const paused = def.pause(s, 41_000)
+      expect(paused.timers).toEqual([{ op: 'clear', id: 'round' }])
+      expect(wordView(def.view(paused.state, explainerId)).roundEndsAt).toBeNull()
+      expect(wordView(def.view(paused.state, explainerId)).roundPaused).toBe(true)
+
+      const resumed = def.resume(paused.state, 100_000)
+      expect(resumed.timers).toEqual([{ op: 'set', id: 'round', delayMs: 20_000 }])
+      expect(wordView(def.view(resumed.state, explainerId)).roundEndsAt).toBe(120_000)
+      expect(wordView(def.view(resumed.state, explainerId)).roundPaused).toBe(false)
+    })
+
+    it('pause before word/start_round (no running turn) is a no-op with no timer effect', () => {
+      const def = getGameDefinition('alias')
+      if (!def.pause) throw new Error('expected alias to implement pause')
+      const s = start()
+      const effect = def.pause(s, 5_000)
+      expect(effect.timers).toBeUndefined()
+      expect(effect.state).toEqual(s)
+    })
+
+    it('resume on a round that was never paused is a no-op', () => {
+      const def = getGameDefinition('alias')
+      if (!def.resume) throw new Error('expected alias to implement resume')
+      let s = start()
+      const explainerId = wordView(def.view(s, 'a')).explainerId
+      if (!explainerId) throw new Error('expected an explainer')
+      s = def.reduce(s, { type: 'word/start_round' }, CTX(explainerId, 1_000)).state
+      const effect = def.resume(s, 5_000)
+      expect(effect.timers).toBeUndefined()
+      expect(effect.state).toEqual(s)
+    })
+  })
 })

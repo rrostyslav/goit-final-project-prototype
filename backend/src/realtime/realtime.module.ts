@@ -1,5 +1,7 @@
 import { Logger, Module, type OnModuleInit } from '@nestjs/common'
 import { AuthModule } from '../auth/auth.module'
+import { GameRuntimeService } from '../games/game-runtime.service'
+import { GamesModule } from '../games/games.module'
 import { NotificationsModule } from '../notifications/notifications.module'
 import { NotificationsService } from '../notifications/notifications.service'
 import { RedisModule } from '../redis/redis.module'
@@ -11,9 +13,13 @@ import { lockKey, RealtimeGateway } from './realtime.gateway'
 
 // `NotificationsModule` has no dependency on this module (or on anything
 // that depends on it), so importing it here to reach `NotificationsService`
-// does not create a cycle.
+// does not create a cycle. `GamesModule` is the same shape of import for
+// Task 16: it depends on `RoomsModule` but never on `RealtimeModule`, so
+// importing it here to reach `GameRuntimeService` (both for direct
+// injection into `RealtimeGateway`, and for the `setGateway` wiring below)
+// does not create one either.
 @Module({
-  imports: [AuthModule, RedisModule, RoomsModule, NotificationsModule],
+  imports: [AuthModule, RedisModule, RoomsModule, NotificationsModule, GamesModule],
   providers: [RealtimeGateway, PresenceService],
   exports: [RealtimeGateway, PresenceService],
 })
@@ -26,6 +32,7 @@ export class RealtimeModule implements OnModuleInit {
     private readonly roomsService: RoomsService,
     private readonly redisService: RedisService,
     private readonly notificationsService: NotificationsService,
+    private readonly gameRuntimeService: GameRuntimeService,
   ) {}
 
   /** Wired here (not inside PresenceService/NotificationsService
@@ -57,5 +64,12 @@ export class RealtimeModule implements OnModuleInit {
         this.logger.error(`notification delivery failed for user ${userId}: ${message}`)
       })
     })
+
+    // Mirrors the two wirings above: `GameRuntimeService` depends on
+    // `RealtimeGateway` only through this narrow `GameSocketGateway`
+    // interface (emitToUser/broadcastRoomState), set here rather than
+    // through constructor injection, so `GamesModule` never has to import
+    // `RealtimeModule` back.
+    this.gameRuntimeService.setGateway(this.gateway)
   }
 }

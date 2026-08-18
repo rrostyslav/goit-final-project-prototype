@@ -1,4 +1,4 @@
-import type { GameId, RoomBrowserEntry, RoomDto, RoomVisibility } from '@gp/shared'
+import type { GameId, RoomBrowserEntry, RoomDto, RoomStatus, RoomVisibility } from '@gp/shared'
 import { GAME_CATALOG, ROOM_MAX_PLAYERS, ROOM_MIN_PLAYERS } from '@gp/shared'
 import {
   BadRequestException,
@@ -305,6 +305,19 @@ export class RoomsService {
     if (room.hostId !== userId) {
       throw new ForbiddenException('Only the host can perform this action')
     }
+  }
+
+  /** Drives the `lobby -> in_game -> results -> lobby` transitions that
+   * Task 16's `GameRuntimeService` owns: it starts a session (`in_game`),
+   * finishes one (`results`), and returns to the lobby after the results
+   * countdown. Deliberately just a status write — GameRuntimeService is the
+   * only caller and already holds every other invariant (host check, player
+   * count, session bookkeeping) around each transition, so this stays a
+   * thin primitive rather than re-validating decisions made one layer up. */
+  async setStatus(roomId: string, status: RoomStatus): Promise<void> {
+    const room = await this.getRoomOrThrow(roomId)
+    room.status = status
+    await room.save()
   }
 
   private async createRoomWithUniqueCode(hostId: string, input: CreateRoomInput): Promise<Room> {
