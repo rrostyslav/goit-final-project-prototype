@@ -40,6 +40,43 @@ import type { AppServer, AppSocket } from './socket-user'
 const CHAT_RATE_LIMIT_MAX = 10
 const CHAT_RATE_LIMIT_WINDOW_MS = 10_000
 
+/** Review finding (Task 18 fix-up): neither `draw:stroke` nor `draw:clear`
+ * had any rate limit, unlike every other write-y handler in this file
+ * (`room:chat` above). Combined with the stroke-bound fix in
+ * `drawing.service.ts`, an ordinary Crocodile explainer — no privilege
+ * escalation needed — could otherwise flood Redis and every other member's
+ * socket at transport speed. `RedisService.rateLimit` fails open (see that
+ * method's own doc comment), same as `room:chat`'s usage below.
+ *
+ * The frontend throttles strokes to ~1 per 50ms (~20/s). 40 strokes per
+ * 1000ms gives a legitimate fast-drawing explainer 2x headroom over that
+ * cadence (jitter, a brief pause followed by a catch-up burst, etc.)
+ * without ever letting a flood push more than 40 strokes/s past this
+ * handler per user — down from effectively unbounded. */
+const DRAW_STROKE_RATE_LIMIT_MAX = 40
+const DRAW_STROKE_RATE_LIMIT_WINDOW_MS = 1_000
+
+/** `draw:clear` is a rare, deliberate user action (a handful of times per
+ * game at most) — 5 per second is already generous headroom for a
+ * double-click or a flaky client retry, while still capping a spam loop. */
+const DRAW_CLEAR_RATE_LIMIT_MAX = 5
+const DRAW_CLEAR_RATE_LIMIT_WINDOW_MS = 1_000
+
+/** Review finding (Task 18 fix-up): Socket.IO's own default
+ * (`maxHttpBufferSize`, 1e6 / 1MB) was never overridden, so the real
+ * per-message ceiling on this whole namespace — not just `draw:stroke` —
+ * was the library default rather than a deliberate number. A legitimate
+ * maximum-size canonical stroke (512 points, a 32-char colour, one width
+ * number) JSON-encodes to well under 32KB even in the most pessimistic
+ * floating-point-formatting case; every other event on this namespace
+ * (`room:chat`'s `CHAT_MAX_LENGTH`-bounded text, `game:action`, `room:join`,
+ * `voice:token`) is smaller still. 64KB leaves that a comfortable ~2x+
+ * margin while cutting the transport-level ceiling to roughly 1/16th of the
+ * previous 1MB default — closing off the bulk of the "one giant frame"
+ * attack surface at the transport itself, before a payload is even parsed
+ * far enough for `assertValidStroke` to run. */
+const MAX_HTTP_BUFFER_SIZE_BYTES = 64 * 1024
+
 /** WebSocket gateway for the `/rt` namespace: room membership, presence
  * overlay, chat and game-selection voting. Task 16 (game runtime) and Task
  * 18 (voice tokens) add their own `@SubscribeMessage` handlers to this same
@@ -52,6 +89,9 @@ const CHAT_RATE_LIMIT_WINDOW_MS = 10_000
   // HTTP API in main.ts — Socket.IO CORS here does not need to be scoped to
   // a specific origin for auth safety. Reflects the request origin.
   cors: { origin: true, credentials: true },
+  // Review finding (Task 18 fix-up): see `MAX_HTTP_BUFFER_SIZE_BYTES`'s own
+  // doc comment above for the sizing rationale.
+  maxHttpBufferSize: MAX_HTTP_BUFFER_SIZE_BYTES,
 })
 export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConnection<AppSocket> {
   @WebSocketServer() server!: AppServer
@@ -422,7 +462,24 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
    * then: nobody has been handed the word yet, so nobody may draw). Stroke
    * shape/bounds are `DrawingService.append`'s job (see its own doc
    * comment for the exact limits); this handler never inspects the stroke
-   * itself beyond handing it there. */
+   * itself beyond handing it there.
+   *
+   * Review finding (Task 18 fix-up): a flood past this point (the explainer
+   * IS authorized, so the check above alone doesn't stop a burst) used to
+   * hit Redis and re-broadcast at whatever rate the transport allowed. Now
+   * rate-limited per user via `DRAW_STROKE_RATE_LIMIT_MAX`/`_WINDOW_MS` (see
+   * their doc comment for the numbers). A rate-limited stroke is DROPPED
+   * SILENTLY, deliberately not routed through the `error` emit below —
+   * emitting one `error` per throttled stroke would just trade a flood of
+   * `draw:stroke` broadcasts for an equally sized flood of `error` events
+   * back at the same sender, which defeats the point of throttling. This
+   * never disconnects the sender either; drawing simply resumes once the
+   * window rolls over.
+   *
+   * Also broadcasts `DrawingService.append`'s CANONICAL return value, not
+   * `payload.stroke` — see that method's doc comment; the raw,
+   * caller-supplied object (which could carry an unbounded extra property
+   * validation forgot to check) must never reach the wire. */
   @SubscribeMessage('draw:stroke')
   async onDrawStroke(
     @ConnectedSocket() socket: AppSocket,
@@ -441,21 +498,33 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       return
     }
 
+    const withinLimit = await this.redisService.rateLimit(
+      drawStrokeRateLimitKey(actorId),
+      DRAW_STROKE_RATE_LIMIT_MAX,
+      DRAW_STROKE_RATE_LIMIT_WINDOW_MS,
+    )
+    if (!withinLimit) return
+
+    let canonical: DrawStroke
     try {
-      await this.drawingService.append(roomId, payload.stroke)
+      canonical = await this.drawingService.append(roomId, payload.stroke)
     } catch (err) {
       await this.emitToUser(actorId, 'error', toErrorPayload(err))
       return
     }
     // "Broadcast to the rest of the room" per the brief — `socket.to`
     // excludes the sender, who already has the stroke locally.
-    socket.to(roomId).emit('draw:stroke', payload.stroke)
+    socket.to(roomId).emit('draw:stroke', canonical)
   }
 
   /** No ack, same rationale as `onDrawStroke`. Allowed for the current
    * Crocodile explainer OR the room host (the brief's "explainer or host"),
    * checked independently — a host who is not currently explaining may
-   * still reset a stuck/vandalized canvas. */
+   * still reset a stuck/vandalized canvas.
+   *
+   * Review finding (Task 18 fix-up): rate-limited per user (see
+   * `DRAW_CLEAR_RATE_LIMIT_MAX`/`_WINDOW_MS`'s doc comment), same
+   * silent-drop-on-throttle rationale as `onDrawStroke`. */
   @SubscribeMessage('draw:clear')
   async onDrawClear(
     @ConnectedSocket() socket: AppSocket,
@@ -476,6 +545,13 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       })
       return
     }
+
+    const withinLimit = await this.redisService.rateLimit(
+      drawClearRateLimitKey(actorId),
+      DRAW_CLEAR_RATE_LIMIT_MAX,
+      DRAW_CLEAR_RATE_LIMIT_WINDOW_MS,
+    )
+    if (!withinLimit) return
 
     await this.clearDrawing(roomId)
   }
@@ -703,6 +779,14 @@ function userRoom(userId: string): string {
 
 function chatRateLimitKey(userId: string): string {
   return `ratelimit:chat:${userId}`
+}
+
+function drawStrokeRateLimitKey(userId: string): string {
+  return `ratelimit:draw:stroke:${userId}`
+}
+
+function drawClearRateLimitKey(userId: string): string {
+  return `ratelimit:draw:clear:${userId}`
 }
 
 function assertNonEmptyString(value: unknown, field: string): string {

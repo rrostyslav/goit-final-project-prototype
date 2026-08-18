@@ -40,6 +40,15 @@ export const DRAW_STROKE_MAX_COLOR_LENGTH = 32
 export const DRAW_STROKE_MIN_WIDTH = 1
 export const DRAW_STROKE_MAX_WIDTH = 40
 
+/** Review finding (Task 18 fix-up): the bounds above only ever checked
+ * `points`/`color`/`width` — nothing rejected an EXTRA top-level property, so
+ * a stroke carrying a legitimate `points`/`color`/`width` plus, say, a
+ * 500KB junk field sailed through `assertValidStroke` untouched. Every key
+ * on an incoming stroke must be one of these three, or the whole stroke is
+ * rejected (`BAD_REQUEST`, same code every other bound violation in this
+ * file already uses) before any of the size/shape checks below even run. */
+export const DRAW_STROKE_ALLOWED_KEYS: ReadonlySet<string> = new Set(['points', 'color', 'width'])
+
 function drawKey(roomId: RoomId): string {
   return `draw:${roomId}`
 }
@@ -62,16 +71,33 @@ export class DrawingService {
   /** Validates `stroke` (throws `BadRequestException` — see the exported
    * bounds above — for anything outside them; nothing is written to Redis
    * on that path), appends it to the room's log, trims the log to the last
-   * `DRAW_STROKE_LOG_LIMIT` entries, and refreshes the key's TTL. */
-  async append(roomId: RoomId, stroke: DrawStroke): Promise<void> {
+   * `DRAW_STROKE_LOG_LIMIT` entries, and refreshes the key's TTL.
+   *
+   * Returns the CANONICAL stroke that was actually stored, not the object
+   * the caller passed in. Review finding (Task 18 fix-up): the raw,
+   * caller-supplied object must never reach `JSON.stringify` or a broadcast
+   * — `assertValidStroke` only checked that `points`/`color`/`width` were
+   * present and in-bounds, it never bounded the wire payload as a whole (an
+   * object satisfying every one of those checks could still carry an
+   * arbitrary extra property of any size). Unknown top-level keys are now
+   * rejected outright (see `assertValidStroke`), and this method additionally
+   * rebuilds a fresh object containing only the three known fields before
+   * anything is written or handed back to the caller — belt-and-suspenders,
+   * so a caller (`RealtimeGateway.onDrawStroke`) that broadcasts this
+   * method's return value instead of the request payload can never leak
+   * more than `points`/`color`/`width` regardless of what future validation
+   * gaps might otherwise let through. */
+  async append(roomId: RoomId, stroke: DrawStroke): Promise<DrawStroke> {
     assertValidStroke(stroke)
+    const canonical = toCanonicalStroke(stroke)
     const key = drawKey(roomId)
-    await this.redisService.client.rpush(key, JSON.stringify(stroke))
+    await this.redisService.client.rpush(key, JSON.stringify(canonical))
     // Keeps the most recent DRAW_STROKE_LOG_LIMIT entries: LTRIM's negative
     // indices count from the tail, so `-LIMIT..-1` is exactly "the last
     // LIMIT elements," regardless of how many are actually in the list yet.
     await this.redisService.client.ltrim(key, -DRAW_STROKE_LOG_LIMIT, -1)
     await this.redisService.client.expire(key, TTL_SECONDS)
+    return canonical
   }
 
   /** Empties a room's drawing log — called both for an explicit
@@ -102,6 +128,11 @@ function assertValidStroke(value: unknown): asserts value is DrawStroke {
     throw new BadRequestException('stroke must be an object')
   }
   const obj = value as Record<string, unknown>
+
+  const unexpectedKey = Object.keys(obj).find((key) => !DRAW_STROKE_ALLOWED_KEYS.has(key))
+  if (unexpectedKey !== undefined) {
+    throw new BadRequestException(`stroke has an unexpected property: "${unexpectedKey}"`)
+  }
 
   const points = obj.points
   if (!Array.isArray(points) || points.length === 0) {
@@ -137,6 +168,22 @@ function assertValidStroke(value: unknown): asserts value is DrawStroke {
     throw new BadRequestException(
       `stroke width must be a number between ${DRAW_STROKE_MIN_WIDTH} and ${DRAW_STROKE_MAX_WIDTH}`,
     )
+  }
+}
+
+/** Rebuilds `stroke` as a brand-new object containing only `points`, `color`
+ * and `width` — called only after `assertValidStroke` has already narrowed
+ * `stroke` to exactly those three keys, so this never silently drops a field
+ * a caller actually needed. Points are copied into fresh `[number, number]`
+ * pairs (not just `.slice()`d) so nothing beyond the two numeric coordinates
+ * — extra array entries, non-index properties, etc. — can ride along inside
+ * a "point." See `append`'s doc comment for why this exists as a second,
+ * independent layer under the unknown-key rejection above. */
+function toCanonicalStroke(stroke: DrawStroke): DrawStroke {
+  return {
+    points: stroke.points.map((point): [number, number] => [point[0], point[1]]),
+    color: stroke.color,
+    width: stroke.width,
   }
 }
 

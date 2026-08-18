@@ -163,7 +163,9 @@ describe('DrawingService', () => {
       const atLimit: [number, number][] = Array.from({ length: DRAW_STROKE_MAX_POINTS }, () => [
         0, 0,
       ])
-      await expect(service.append('r1', stroke({ points: atLimit }))).resolves.toBeUndefined()
+      await expect(service.append('r1', stroke({ points: atLimit }))).resolves.toEqual(
+        stroke({ points: atLimit }),
+      )
     })
 
     it('rejects absurd coordinates (out of bounds)', async () => {
@@ -217,6 +219,62 @@ describe('DrawingService', () => {
         BadRequestException,
       )
       expect(await service.getAll('r1')).toEqual([])
+    })
+  })
+
+  // ---------------------------------------------------------------------
+  // Review finding: `assertValidStroke` bounded points/color/width but
+  // never bounded the wire payload as a whole — a stroke satisfying every
+  // one of those checks could still carry an arbitrary extra property of
+  // any size, which was `JSON.stringify`'d and broadcast in full. Fixed by
+  // (a) rejecting any unexpected top-level key outright and (b) having
+  // `append` return a freshly-built canonical object (only `points`,
+  // `color`, `width`) rather than the caller's own object, so a caller that
+  // broadcasts the return value can never leak more than those three
+  // fields regardless of what validation might miss in the future.
+  // ---------------------------------------------------------------------
+  describe('wire-payload bound (extra properties)', () => {
+    it('rejects a stroke carrying an extra top-level property, however large', async () => {
+      const client = createFakeRedisClient()
+      const service = createService(client)
+      // Mirrors the reviewer's live repro: a stroke with otherwise-valid
+      // points/color/width plus one huge extra field.
+      const malicious = { ...stroke(), evil: 'x'.repeat(500_000) } as unknown as DrawStroke
+
+      await expect(service.append('r1', malicious)).rejects.toBeInstanceOf(BadRequestException)
+      // Nothing reached Redis — trivially "only points/color/width", since
+      // nothing was stored at all.
+      expect(await service.getAll('r1')).toEqual([])
+    })
+
+    it('rejects a small, innocuous-looking extra property just as well', async () => {
+      const service = createService(createFakeRedisClient())
+      const withExtra = { ...stroke(), toolId: 'pencil' } as unknown as DrawStroke
+      await expect(service.append('r1', withExtra)).rejects.toBeInstanceOf(BadRequestException)
+    })
+
+    it('returns and stores a fresh canonical object, not the caller-supplied one', async () => {
+      const client = createFakeRedisClient()
+      const service = createService(client)
+      const original = stroke()
+
+      const returned = await service.append('r1', original)
+
+      expect(returned).toEqual(original)
+      expect(returned).not.toBe(original)
+      expect(returned.points).not.toBe(original.points)
+      expect(Object.keys(returned).sort()).toEqual(['color', 'points', 'width'])
+
+      // Mutating the caller's object after the call must not reach back
+      // into what was already written to Redis or already returned —
+      // proving `append` copied the data rather than keeping a live
+      // reference to the request payload.
+      original.color = 'mutated-after-the-fact'
+      const firstPoint = original.points[0]
+      if (firstPoint) firstPoint[0] = 999_999
+
+      expect(returned.color).toBe('#ff0000')
+      expect(await service.getAll('r1')).toEqual([stroke()])
     })
   })
 })
