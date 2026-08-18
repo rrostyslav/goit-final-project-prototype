@@ -1,0 +1,20 @@
+# Example shapes only — copy to terraform.tfvars and fill in real values.
+# Do NOT commit terraform.tfvars (it is gitignored alongside *.tfstate*).
+
+project     = "gameplatform"
+environment = "development"
+aws_region  = "eu-central-1"
+
+vpc_cidr = "10.0.0.0/16"
+
+cluster_version   = "1.30"
+db_instance_class = "db.t4g.micro"
+redis_node_type   = "cache.t4g.micro"
+
+# "owner/repo" — scopes the GitHub Actions OIDC trust policy (Task 25).
+github_repository = "your-org/your-repo"
+
+# Leave null until modules/eks (Task 25) exists and outputs
+# node_security_group_id; wire that output through here (or directly into
+# modules/rds and modules/redis) once it does.
+eks_node_security_group_id = null
