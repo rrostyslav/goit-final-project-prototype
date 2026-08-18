@@ -14,15 +14,23 @@ export function resolveNickname(members: RoomMemberDto[], id: PlayerId): string 
   return members.find((member) => member.user.id === id)?.user.nickname ?? id
 }
 
+/** `buildTeams` in the word engine emits deterministic ids of the form
+ * `team-{index}`. Deriving the display number from the id keeps the label in
+ * the user's language instead of echoing the server's English `team.name`. */
+function teamNumber(teamId: string): number {
+  const parsed = Number.parseInt(teamId.replace(/^team-/, ''), 10)
+  return Number.isFinite(parsed) ? parsed + 1 : 1
+}
+
 export interface TeamScoreboardProps {
   teams: TeamView[]
   activeTeamId: string | null
-  /** Alias/Hat group real teams (`team.name` is meaningful, e.g. "Team 1",
-   * and a team's roster is worth showing). Crocodile is not team-based --
-   * `createWordRound`'s `teamCount` is set to the player count, so every
-   * `TeamView` here has exactly one member and `team.name` is a meaningless
-   * "Team 1" (see this task's report) -- the row must be labelled with that
-   * one member's nickname instead, and there is no roster line to show. */
+  /** Alias/Hat group real teams, so a team's roster is worth showing. Note
+   * `team.name` is server-generated English ("Team 1") and is never rendered
+   * -- the label comes from the team's index via the dictionary, so the UI
+   * stays translated. Crocodile is not team-based: `createWordRound`'s
+   * `teamCount` equals the player count, so every `TeamView` has exactly one
+   * member and the row is labelled with that member's nickname instead. */
   teamBased: boolean
   members: RoomMemberDto[]
   selfId: PlayerId
@@ -45,7 +53,9 @@ export function TeamScoreboard({
         {sorted.map((team) => {
           const isActive = team.id === activeTeamId
           const isSelfTeam = team.memberIds.includes(selfId)
-          const label = teamBased ? team.name : resolveNickname(members, team.memberIds[0] ?? '?')
+          const label = teamBased
+            ? t('game.teamLabel', { number: teamNumber(team.id) })
+            : resolveNickname(members, team.memberIds[0] ?? '?')
           const roster = teamBased
             ? team.memberIds.map((id) => resolveNickname(members, id)).join(', ')
             : null
