@@ -1,6 +1,6 @@
 import type { ConnectionState } from '@gp/shared'
 import { RECONNECT_GRACE_MS } from '@gp/shared'
-import { Injectable, Logger } from '@nestjs/common'
+import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common'
 
 type EvictionHandler = (roomId: string, userId: string) => Promise<void>
 
@@ -24,7 +24,7 @@ interface PresenceEntry {
  * per-process: presence is not shared across horizontally-scaled gateway
  * instances (see Task 15's report for the reasoning). */
 @Injectable()
-export class PresenceService {
+export class PresenceService implements OnModuleDestroy {
   private readonly logger = new Logger(PresenceService.name)
   private readonly entries = new Map<string, PresenceEntry>()
   private evictionHandler: EvictionHandler = async () => {}
@@ -75,6 +75,26 @@ export class PresenceService {
 
   getConnection(roomId: string, userId: string): ConnectionState {
     return this.entries.get(presenceKey(roomId, userId))?.state ?? 'online'
+  }
+
+  /** Cancels every pending reconnect-grace timer on application shutdown —
+   * mirrors `GameTimerService.onModuleDestroy`'s same rationale. Without
+   * this, a `markDisconnected` call shortly before shutdown (e.g. a socket
+   * that disconnects as part of the app closing) leaves a up-to-
+   * `RECONNECT_GRACE_MS` (45s) `setTimeout` armed against a torn-down
+   * process: it keeps the Node event loop alive well past `app.close()`
+   * resolving (surfacing as Jest's "did not exit" warning in the e2e
+   * suite), and once it does fire, `evictionHandler` runs against Postgres/
+   * Redis connections that `RedisService`/Sequelize have already closed. */
+  onModuleDestroy(): void {
+    const keys = [...this.entries.keys()]
+    for (const key of keys) {
+      this.clearTimer(key)
+    }
+    this.entries.clear()
+    if (keys.length > 0) {
+      this.logger.log(`cleared ${keys.length} pending presence timer(s) on shutdown`)
+    }
   }
 
   private clearTimer(key: string): void {

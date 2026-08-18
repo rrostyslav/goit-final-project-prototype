@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common'
+import { Injectable, Logger, type OnApplicationShutdown } from '@nestjs/common'
 import Redis from 'ioredis'
 import { AppConfigService } from '../config/env.config'
 
@@ -24,7 +24,7 @@ end
 // a `withLock` helper (for serializing room mutations across gateway
 // instances) — additive on top of Task 9's `client` + `rateLimit`.
 @Injectable()
-export class RedisService implements OnModuleDestroy {
+export class RedisService implements OnApplicationShutdown {
   private readonly logger = new Logger(RedisService.name)
 
   readonly client: Redis
@@ -116,7 +116,22 @@ export class RedisService implements OnModuleDestroy {
     }
   }
 
-  async onModuleDestroy(): Promise<void> {
+  /** Deliberately `OnApplicationShutdown`, not `OnModuleDestroy`: NestJS's own
+   * `NestApplicationContext.close()` runs every provider's `OnModuleDestroy`
+   * hook BEFORE it calls `dispose()` — the step that actually closes the
+   * Socket.IO server, which is what triggers `@socket.io/redis-adapter`'s own
+   * `RedisAdapter.close()` (a `punsubscribe`/`unsubscribe` against `client`/
+   * `subscriber`) for every namespace. `OnApplicationShutdown` hooks run in
+   * `callShutdownHook()`, AFTER `dispose()` — so quitting here, not in
+   * `OnModuleDestroy`, is what makes these connections still open when the
+   * adapter needs them one last time. Getting this backwards was a real,
+   * 100%-reproducible bug (not a test-only timing fluke): with the
+   * connections quit in `OnModuleDestroy`, EVERY graceful shutdown of this
+   * app — not just this task's e2e suite — hit an unhandled "Connection is
+   * closed." rejection from the adapter's own cleanup, for both the default
+   * `/` namespace and `/rt`. `@nestjs/sequelize`'s own `SequelizeCoreModule`
+   * closes its connection the exact same way, for the exact same reason. */
+  async onApplicationShutdown(): Promise<void> {
     await Promise.all([this.client.quit(), this.subscriber.quit()])
   }
 }
