@@ -1,7 +1,12 @@
 'use client'
 
 import type { Locale, RoomDto } from '@gp/shared'
-import { ROOM_CODE_LENGTH, ROOM_MAX_PLAYERS, SUPPORTED_LOCALES } from '@gp/shared'
+import {
+  ROOM_CODE_ALPHABET,
+  ROOM_CODE_LENGTH,
+  ROOM_MAX_PLAYERS,
+  SUPPORTED_LOCALES,
+} from '@gp/shared'
 import { useRouter } from 'next/navigation'
 import { type FormEvent, useState } from 'react'
 import { Avatar } from '@/components/ui/avatar'
@@ -16,6 +21,18 @@ import { useAuthStore } from '@/lib/stores/auth-store'
 const LOCALE_LABEL_KEYS: Record<Locale, string> = {
   uk: 'nav.localeUk',
   en: 'nav.localeEn',
+}
+
+/** Room codes deliberately exclude I, O, 0 and 1 so a code read aloud or
+ * copied off a screen is unambiguous. Enforce that alphabet as the user
+ * types rather than letting an impossible code reach the server as a 404. */
+function sanitizeRoomCode(raw: string): string {
+  return raw
+    .toUpperCase()
+    .split('')
+    .filter((char) => ROOM_CODE_ALPHABET.includes(char))
+    .join('')
+    .slice(0, ROOM_CODE_LENGTH)
 }
 
 export default function LandingPage() {
@@ -159,7 +176,7 @@ function AuthenticatedPanel({
 
   function handleJoinSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const code = roomCode.trim().toUpperCase()
+    const code = sanitizeRoomCode(roomCode)
     if (code.length !== ROOM_CODE_LENGTH) {
       setCodeError(t('room.codeInvalidLength'))
       return
@@ -192,7 +209,7 @@ function AuthenticatedPanel({
           label={t('room.joinTitle')}
           placeholder={t('room.codePlaceholder')}
           value={roomCode}
-          onChange={(event) => setRoomCode(event.target.value.toUpperCase())}
+          onChange={(event) => setRoomCode(sanitizeRoomCode(event.target.value))}
           error={codeError ?? undefined}
           maxLength={ROOM_CODE_LENGTH}
         />

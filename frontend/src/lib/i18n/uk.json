@@ -1,32 +1,26 @@
 {
   "meta.title": "Ігрова платформа",
   "meta.description": "Голосові кімнати та міні-ігри для друзів у браузері.",
-
   "app.heroTitle": "Грайте разом. Голосом і не тільки.",
   "app.heroBody": "Створіть кімнату, покличте друзів у голосовий чат і грайте в Аліас, Капелюх, Крокодила, Дурня чи Дев'ятку — прямо в браузері.",
   "app.featureVoice": "Голосовий чат у кожній кімнаті",
   "app.featureGames": "П'ять міні-ігор на вибір",
   "app.featureRooms": "Кімнати за кодом — миттєвий вхід",
-
   "auth.nicknameLabel": "Нікнейм",
   "auth.nicknamePlaceholder": "Введіть нікнейм",
   "auth.nicknameRequired": "Введіть нікнейм, щоб продовжити",
   "auth.playAsGuest": "Грати як гість",
   "auth.playingAsGuest": "Входимо...",
   "auth.guestError": "Не вдалося увійти. Спробуйте ще раз.",
-
   "room.createRoom": "Створити кімнату",
   "room.creatingRoom": "Створюємо...",
   "room.createError": "Не вдалося створити кімнату. Спробуйте ще раз.",
   "room.joinTitle": "Приєднатися за кодом",
-  "room.codeLabel": "Код кімнати",
   "room.codePlaceholder": "ABC123",
   "room.join": "Приєднатися",
   "room.codeInvalidLength": "Код кімнати має містити 6 символів",
-
   "nav.localeUk": "Українська",
   "nav.localeEn": "English",
-
   "common.loggedInAs": "Ви увійшли як {nickname}",
   "common.logout": "Вийти",
   "common.close": "Закрити"
