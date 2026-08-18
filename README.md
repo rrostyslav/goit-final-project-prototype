@@ -18,8 +18,8 @@ per category beyond the five described here.
 | Word games | Alias, Hat (Alias in a different scoring mode), Crocodile (word engine + a drawing channel) |
 | Card games | Durak, Nine |
 | Auth | guest mode, email register/login, guest→account upgrade (same user id), Google OAuth behind an env flag |
-| Social | friends, friend requests, in-app notifications, match history |
-| Moderation | kick, ban, report, rate limiting on room creation |
+| Social | friends, friend requests, in-app notifications (pushed and stored server-side; no frontend component reads them yet), match history |
+| Moderation | kick, ban, rate limiting on room creation, player reports (`POST /api/rooms/:id/report` + a `RoomReport` table; no frontend surface — no report button anywhere in the UI yet) |
 | Infra | Terraform modules, Helm charts, GitHub Actions — **configuration only, nothing is deployed** (see [Infra](#infra--configuration-only-nothing-is-deployed)) |
 
 ## Repository layout
@@ -163,7 +163,7 @@ pnpm build                  # shared, game-core, frontend (Next build), backend 
 cd backend && pnpm test:e2e  # real-socket e2e scenarios, needs docker compose services running
 ```
 
-**Test coverage as of this commit:** backend 137 unit tests + 3 e2e
+**Test coverage as of this commit:** backend 152 unit tests + 3 e2e
 scenarios (full Alias lifecycle, a rejected out-of-turn action, and
 disconnect/reconnect within the grace period, all over real sockets against
 a real Postgres+Redis); `libs/game-core` 118 tests (rule tables, round
@@ -172,10 +172,6 @@ flows, deterministic-shuffle property tests, `view()` secret-leak checks).
 placeholder that exits 0. Everything on the frontend was verified manually
 during development; there is no regression net for it beyond `typecheck` and
 `build`.
-
-Full command output from the most recent run of every one of the above, plus
-Terraform/Helm/workflow validation and a clean-clone smoke test, is recorded
-in `.superpowers/sdd/task-28-report.md`.
 
 ## Infra — configuration only, nothing is deployed
 
@@ -211,6 +207,26 @@ a GitHub OIDC role for CI, Argo CD, and a monitoring stack; Helm charts for
   `charts/backend-api/values.yaml` defaults to `replicaCount: 1` and
   `autoscaling.enabled: false` for exactly this reason — turning on the HPA
   today is a correctness regression, not added capacity.
+- **In-process game timers do not survive a restart, and neither does the
+  Redis state they depend on — there is no rehydration and no TTL.**
+  `GameTimerService`'s round clock (word games) and
+  `GameRuntimeService`'s `lobbyReturnTimers` (the 8s `results → lobby`
+  countdown) are bare `setTimeout` calls tracked only in process memory;
+  the `game:state:*` and `room:session:*` Redis keys they depend on carry no
+  TTL either. Any pod restart — including a routine Helm rolling update at
+  the default `replicaCount: 1` — leaves an in-flight round's clock never
+  firing, and strands any room caught inside the 8-second results window in
+  `results` with no player action able to clear it. Word games are partly
+  recoverable (the explainer's own end-round button still dispatches once
+  the process is back, since the Redis state itself survived); a stuck
+  `results` screen is not. The fix for a player abandoning a game (see
+  `GameRuntimeService.abandonIfPlayerLeft`) does **not** rescue this case
+  either: by the time a room reaches `results`, `doFinish` has already
+  cleared the session state that fix depends on to detect an active game, so
+  a departure during `results` is simply a no-op. A real fix needs a
+  durable/shared scheduler (e.g. a Redis-backed delayed job queue) plus TTLs
+  on both Redis key families — the same shape of gap `GameTimerService`'s
+  own doc comment already names for the timer half of this.
 - **The backend-api Ingress is inert by default.** Its
   `alb.ingress.kubernetes.io/*` annotations target the AWS Load Balancer
   Controller. This repo's Terraform does not install that controller (only
@@ -218,9 +234,13 @@ a GitHub OIDC role for CI, Argo CD, and a monitoring stack; Helm charts for
   will render, but nothing will satisfy it until an operator installs the
   AWS Load Balancer Controller on the target cluster — that is a named
   prerequisite for a real deployment, not an implementation detail.
-- **`cluster_endpoint_public_access_cidrs` defaults to `0.0.0.0/0`** — the
-  EKS API server is open to the internet by default. Acceptable for a
-  prototype that deploys nothing; must be narrowed before any real use.
+- **The EKS API server is open to the internet by default.** The root
+  `eks_cluster_endpoint_public_access_cidrs` variable (passed through to
+  `modules/eks`'s `cluster_endpoint_public_access_cidrs`) defaults to
+  `0.0.0.0/0`. It genuinely is a tunable knob — set it in `terraform.tfvars`
+  (see `terraform.tfvars.example`) to an office/VPN/CI-runner CIDR range —
+  but the shipped default is acceptable only for a prototype that deploys
+  nothing; narrow it before any real use.
 - **The access token lives in `localStorage`**, which is readable by any
   script that achieves XSS on the frontend. This is bounded, not fixed: the
   access token's TTL is 15 minutes, and the refresh token that renews it

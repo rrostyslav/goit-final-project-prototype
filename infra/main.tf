@@ -29,6 +29,8 @@ module "eks" {
 
   cluster_version     = var.cluster_version
   node_instance_types = var.eks_node_instance_types
+
+  cluster_endpoint_public_access_cidrs = var.eks_cluster_endpoint_public_access_cidrs
 }
 
 module "rds" {

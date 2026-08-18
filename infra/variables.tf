@@ -38,6 +38,20 @@ variable "eks_node_instance_types" {
   default     = ["t3.medium"]
 }
 
+# Final-review finding G: this root module never passed a value through to
+# modules/eks's own cluster_endpoint_public_access_cidrs variable, so the
+# README's claim that it is a tunable knob was not actually true at the
+# root -- the only way to change it was editing modules/eks directly. This
+# variable closes that gap: it exists purely to be forwarded to module.eks
+# below (see main.tf), with the exact same insecure-by-default value the
+# module itself already defaulted to, so behaviour is unchanged until an
+# operator actually sets it.
+variable "eks_cluster_endpoint_public_access_cidrs" {
+  description = "CIDR blocks allowed to reach the public EKS API server endpoint. Defaults to unrestricted (0.0.0.0/0) for prototype convenience -- narrow this to an office/VPN/CI-runner range before running this beyond a prototype."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
 variable "db_instance_class" {
   description = "RDS instance class for the PostgreSQL database. Prototype-scale default; size up for real load."
   type        = string

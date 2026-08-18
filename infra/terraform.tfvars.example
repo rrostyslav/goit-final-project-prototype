@@ -12,6 +12,10 @@ eks_node_instance_types = ["t3.medium"]
 db_instance_class       = "db.t4g.micro"
 redis_node_type         = "cache.t4g.micro"
 
+# Narrow this before any real deployment -- defaults to 0.0.0.0/0 (the EKS
+# API server open to the internet) for prototype convenience.
+# eks_cluster_endpoint_public_access_cidrs = ["203.0.113.4/32"]
+
 # "owner/repo" — scopes the GitHub Actions OIDC trust policy to
 # repo:<this>:ref:refs/heads/<github_branch> (see modules/ci-cd).
 github_repository = "your-org/your-repo"
