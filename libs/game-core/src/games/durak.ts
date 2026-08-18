@@ -200,7 +200,17 @@ function finalizeBout(
   let attackerId = oldAttackerId
   let defenderId = oldDefenderId
   if (!gameFinished) {
-    attackerId = mode === 'pass' ? oldDefenderId : nextPlayer(state.order, oldDefenderId, finished)
+    // On a pass, the old defender becomes the new attacker - but only if
+    // they're still in the game. The refill loop above can finish the old
+    // defender in this very call (ran out of cards with an empty deck), in
+    // which case rotation must skip past them exactly like the 'take'
+    // branch already does, or attackerId ends up pointing at a finished
+    // player while phase stays 'active' - a full deadlock (see regression
+    // test).
+    attackerId =
+      mode === 'pass' && !finished.includes(oldDefenderId)
+        ? oldDefenderId
+        : nextPlayer(state.order, oldDefenderId, finished)
     defenderId = nextPlayer(state.order, attackerId, finished)
   }
 
