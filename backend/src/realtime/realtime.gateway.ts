@@ -72,7 +72,13 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
     })
   }
 
-  handleConnection(socket: AppSocket): void {
+  async handleConnection(socket: AppSocket): Promise<void> {
+    // Every socket joins a dedicated `user:{userId}` room up front so
+    // `emitToUser` can target it directly (via the Redis adapter) instead
+    // of scanning every socket in the namespace on each call — this join
+    // does not depend on the socket ever emitting `room:join`.
+    await socket.join(userRoom(socket.data.user.id))
+
     // socket.io removes a socket from all of its rooms as part of the
     // 'disconnect' sequence *before* NestJS's own `handleDisconnect` hook
     // would fire — 'disconnecting' is the one event where `socket.rooms`
@@ -102,8 +108,15 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
 
   /** Emits `event` to every socket belonging to `userId`, on this instance
    * or any other instance sharing the Redis adapter — used by Task 16/18
-   * for game-state pushes and voice-related events, and available for any
-   * future direct-to-user notification delivery. */
+   * for game-state pushes and voice-related events, and by the
+   * `NotificationsService` delivery handler wired in `RealtimeModule` for
+   * live `notification` delivery.
+   *
+   * Targets the socket's `user:{userId}` room (joined by every socket in
+   * `handleConnection`, whether or not it has joined any game room) rather
+   * than `fetchSockets()`-and-filter — the latter pulls every socket in the
+   * namespace across the whole cluster on every call, which does not scale
+   * once Task 16/18 call this far more often than Task 15 does. */
   async emitToUser<E extends keyof ServerToClientEvents>(
     userId: PlayerId,
     event: E,
@@ -113,17 +126,17 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
     // which TS cannot re-derive from the single generic `payload` value
     // above even though it is exactly one argument for every entry in
     // ServerToClientEvents — this local alias asserts the concrete
-    // single-argument function shape once, which is narrower than a bare
-    // `any` cast at every call site would be.
-    type SingleArgEmit = (ev: E, payload: Parameters<ServerToClientEvents[E]>[0]) => boolean
-
-    const sockets = await this.server.fetchSockets()
-    for (const socket of sockets) {
-      if (socket.data.user.id === userId) {
-        const emit = socket.emit as unknown as SingleArgEmit
-        emit(event, payload)
-      }
+    // single-argument shape once, narrower than a bare `any` cast at every
+    // call site would be. Cast the *target* object (not a detached `.emit`
+    // reference): `BroadcastOperator.emit` reads `this.adapter` internally,
+    // so pulling `.emit` off as a standalone function and calling it drops
+    // that `this` binding and throws at runtime — this shape keeps `emit`
+    // called as `target.emit(...)`, preserving it.
+    type SingleArgEmitTarget = {
+      emit: (ev: E, payload: Parameters<ServerToClientEvents[E]>[0]) => boolean
     }
+    const target = this.server.to(userRoom(userId)) as unknown as SingleArgEmitTarget
+    target.emit(event, payload)
   }
 
   // ---------------------------------------------------------------------
@@ -329,7 +342,13 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
 
   private async handleDisconnecting(socket: AppSocket): Promise<void> {
     const userId = socket.data.user.id
-    const roomIds = [...socket.rooms].filter((room) => room !== socket.id)
+    // Excludes both the socket's own default room (its `socket.id`) and its
+    // `user:{userId}` room (joined in `handleConnection` for `emitToUser`)
+    // — neither is a game room, so neither should be handed to presence
+    // bookkeeping or `broadcastRoomState`.
+    const roomIds = [...socket.rooms].filter(
+      (room) => room !== socket.id && room !== userRoom(userId),
+    )
     for (const roomId of roomIds) {
       await this.markDisconnectedIfLastSocket(roomId, userId, socket.id)
     }
@@ -476,8 +495,18 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
 
 class TooManyRequestsError extends Error {}
 
-function lockKey(roomId: string): string {
+/** Exported so `RealtimeModule`'s presence-eviction handler can take the
+ * exact same per-room lock the WS handlers above use — see that module's
+ * `onModuleInit` for why. */
+export function lockKey(roomId: string): string {
   return `room:${roomId}`
+}
+
+/** The Socket.IO room every socket in this namespace joins for its own
+ * user id, independent of any game room — see `handleConnection` and
+ * `emitToUser`. */
+function userRoom(userId: string): string {
+  return `user:${userId}`
 }
 
 function chatRateLimitKey(userId: string): string {

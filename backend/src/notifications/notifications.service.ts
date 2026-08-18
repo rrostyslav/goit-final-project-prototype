@@ -1,29 +1,47 @@
-import type { NotificationDto } from '@gp/shared'
+import type { NotificationDto, UserId } from '@gp/shared'
 import { Injectable, NotFoundException } from '@nestjs/common'
 import { InjectModel } from '@nestjs/sequelize'
 import { Notification } from '../database/models/notification.model'
+
+type DeliveryHandler = (userId: UserId, dto: NotificationDto) => void
 
 @Injectable()
 export class NotificationsService {
   constructor(@InjectModel(Notification) private readonly notificationModel: typeof Notification) {}
 
-  /** Creates a notification row and returns its DTO. Task 15's WebSocket
-   * gateway calls this directly (outside of any HTTP request context) and
-   * emits the returned DTO over the socket, so this method must not depend
-   * on anything request-scoped. */
+  private deliveryHandler: DeliveryHandler | null = null
+
+  /** Wired by `RealtimeModule` (not by this service) so live delivery over
+   * the socket can depend on `RealtimeGateway` without this module — or
+   * any of its other callers, such as `FriendsService` — depending back on
+   * the realtime layer. Mirrors the `PresenceService.setEvictionHandler`
+   * pattern used for the same reason. A missing handler is not an error:
+   * `push` always persists, and notifications remain readable over REST
+   * (`GET /notifications`) even when nothing is listening live. */
+  setDeliveryHandler(fn: DeliveryHandler): void {
+    this.deliveryHandler = fn
+  }
+
+  /** Creates a notification row and returns its DTO. Persists first, then
+   * — if a delivery handler is registered — hands the same DTO to it for
+   * live delivery over the socket. This method must not depend on anything
+   * request-scoped, since it is also called from outside any HTTP request
+   * context (e.g. `FriendsService.sendRequest`). */
   async push(
-    userId: string,
+    userId: UserId,
     type: NotificationDto['type'],
     payload: Record<string, string>,
   ): Promise<NotificationDto> {
     const row = await this.notificationModel.create({ userId, type, payload })
-    return {
+    const dto: NotificationDto = {
       id: row.id,
       type,
       payload,
       createdAt: row.createdAt.toISOString(),
       readAt: null,
     }
+    this.deliveryHandler?.(userId, dto)
+    return dto
   }
 
   async list(userId: string): Promise<NotificationDto[]> {
