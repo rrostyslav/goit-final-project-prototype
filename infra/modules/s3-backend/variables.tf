@@ -12,3 +12,9 @@ variable "aws_region" {
   description = "AWS region to create the state bucket and lock table in."
   type        = string
 }
+
+variable "project" {
+  description = "Project name, applied as the Project tag on the state bucket and lock table."
+  type        = string
+  default     = "gameplatform"
+}

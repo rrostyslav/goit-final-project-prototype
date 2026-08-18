@@ -30,6 +30,17 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
+
+  # This root runs standalone, so it cannot inherit the estate's provider.
+  # Tag its resources the same way anyway, or the state bucket becomes the
+  # one thing in the account nobody can attribute.
+  default_tags {
+    tags = {
+      Project     = var.project
+      Environment = "shared"
+      ManagedBy   = "terraform"
+    }
+  }
 }
 
 resource "aws_s3_bucket" "state" {

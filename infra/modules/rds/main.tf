@@ -19,13 +19,10 @@ resource "aws_security_group" "this" {
   description = "Allow PostgreSQL access from the EKS node security group only"
   vpc_id      = var.vpc_id
 
-  egress {
-    description = "Allow all outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # No egress rule, deliberately. A managed database and cache never
+  # originate connections; AWS treats a security group with no egress rule
+  # as deny-all outbound, which is what we want. Terraform would otherwise
+  # leave the default allow-all rule in place.
 
   tags = {
     Name = "${var.name}-postgres"
