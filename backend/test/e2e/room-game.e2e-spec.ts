@@ -156,13 +156,34 @@ describe('End-to-end: room -> Alias game -> results (real Postgres + Redis)', ()
       if (!firstExplainerId) throw new Error('unreachable')
 
       let explainerSocket = findPlayerSocket(players, sockets, firstExplainerId)
+      const explainerIndex = sockets.indexOf(explainerSocket)
 
-      const afterStart = waitFor(explainerSocket, 'game:state')
+      // Listen on all FOUR real sockets, not just the explainer's — the
+      // pre-draw "all null" check above is trivially true (nobody has
+      // drawn a word yet) and proves nothing about masking. This is the
+      // suite's only direct proof that the server puts the drawn word on
+      // exactly one wire, not merely that the explainer's own payload
+      // happens to contain it.
+      const stateAfterStartPromises = sockets.map((s) => waitFor(s, 'game:state'))
       await emit(explainerSocket, 'game:action', {
         roomId: room.id,
         action: { type: 'word/start_round' },
       })
-      const startedView = asWordView(await afterStart, 'after word/start_round')
+      const rawViewsAfterStart = await Promise.all(stateAfterStartPromises)
+      const viewsAfterStart = rawViewsAfterStart.map((v, i) =>
+        asWordView(v, `state after word/start_round for socket ${i}`),
+      )
+      // Exactly one of the four payloads that actually arrived over the
+      // wire carries the word, and it is the explainer's — the other
+      // three carry `secretWord: null`. A leak that hands the word to
+      // every viewer (or to the wrong viewer) fails this assertion.
+      const revealedTo = viewsAfterStart
+        .map((v, i) => (v.secretWord !== null ? i : -1))
+        .filter((i) => i !== -1)
+      expect(revealedTo).toEqual([explainerIndex])
+
+      const startedView = viewsAfterStart[explainerIndex]
+      if (!startedView) throw new Error('unreachable')
       expect(startedView.phase).toBe('active')
       expect(startedView.secretWord).not.toBeNull()
 
@@ -218,6 +239,23 @@ describe('End-to-end: room -> Alias game -> results (real Postgres + Redis)', ()
       expect(results).toHaveLength(players.length)
       for (const player of players) {
         expect(results.some((r) => r.userId === player.user.id)).toBe(true)
+      }
+
+      // Presence alone (one row per player) isn't enough — a regression
+      // that persisted four rows with the wrong score or the wrong
+      // placement would pass the checks above silently. Compare every
+      // persisted row's VALUES against the `standings` the clients
+      // actually received in `game:ended`: same player, same score, same
+      // placement. Combined with the per-player presence loop above and
+      // the equal lengths already asserted, this also establishes the two
+      // sides cover exactly the same set of player ids.
+      const resultsByUserId = new Map(results.map((r) => [r.userId, r]))
+      for (const standing of ended.standings) {
+        const row = resultsByUserId.get(standing.playerId)
+        expect(row).toBeDefined()
+        if (!row) throw new Error('unreachable')
+        expect(row.score).toBe(standing.score)
+        expect(row.placement).toBe(standing.placement)
       }
 
       const lobbyDto = await waitForRoomStatus(hostSocket, 'lobby', LOBBY_RETURN_TIMEOUT_MS)
