@@ -1,10 +1,14 @@
+import type { GameId } from '@gp/shared'
 import { describe, expect, it } from 'vitest'
 import { getGameDefinition, registerGameDefinition } from '../src/registry'
 
 describe('registry', () => {
   it('throws a clear error for an unregistered game id', () => {
-    // 'nine' is a valid GameId but nothing registers it in this test file.
-    expect(() => getGameDefinition('nine')).toThrow(/nine/)
+    // Task 14 registers the last of the five real GameIds ('nine'), so
+    // every value of the real union is now registered - cast an id that
+    // deliberately isn't one of them to exercise the same "unregistered"
+    // branch in getGameDefinition.
+    expect(() => getGameDefinition('nonexistent-game' as GameId)).toThrow(/nonexistent-game/)
   })
 
   it('returns a definition after it has been registered', () => {

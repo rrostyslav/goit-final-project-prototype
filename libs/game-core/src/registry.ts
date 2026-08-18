@@ -1,7 +1,9 @@
 import type { GameId } from '@gp/shared'
 import type { GameDefinition } from './contract'
 import { aliasDefinition, hatDefinition } from './games/alias'
+import { crocodileDefinition } from './games/crocodile'
 import { durakDefinition } from './games/durak'
+import { nineDefinition } from './games/nine'
 
 /**
  * The game registry. Deliberately typed `Partial<Record<GameId, GameDefinition>>`
@@ -37,9 +39,11 @@ export function getGameDefinition(id: GameId): GameDefinition {
   return definition
 }
 
-// Alias, Hat (Task 12) and Durak (Task 13) register themselves here so any
-// caller that only imports the registry - not the individual game modules -
-// still finds them.
+// Alias, Hat (Task 12), Durak (Task 13), and Crocodile, Nine (Task 14)
+// register themselves here so any caller that only imports the registry -
+// not the individual game modules - still finds them.
 registerGameDefinition(aliasDefinition)
 registerGameDefinition(hatDefinition)
 registerGameDefinition(durakDefinition)
+registerGameDefinition(crocodileDefinition)
+registerGameDefinition(nineDefinition)

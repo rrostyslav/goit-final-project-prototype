@@ -136,6 +136,34 @@ export function scoreWord(
 }
 
 /**
+ * Adds `delta` points directly to the team at `teamIndex`, without touching
+ * `roundResults` and without requiring that team be the active one.
+ * `scoreWord` always credits `state.activeTeamIndex` (whoever is currently
+ * explaining) and appends a `roundResults` entry for the word; games where
+ * credit for the *same* word also belongs to a different participant - e.g.
+ * Crocodile, where a correct guess pays both the explainer (the active team)
+ * and whichever other player is credited with the guess - need a way to
+ * credit that second team without inventing a second `roundResults` entry
+ * for what is still just one word. A `teamIndex` out of range is a no-op
+ * (state returned unchanged, new object) rather than a throw, since it is
+ * only ever reachable if a caller's own index bookkeeping is wrong, and a
+ * silently-ignored stray credit is safer than corrupting an unrelated team.
+ */
+export function scoreTeamAt(
+  state: WordRoundState,
+  teamIndex: number,
+  delta: number,
+): WordRoundState {
+  if (teamIndex < 0 || teamIndex >= state.teams.length) {
+    return { ...state }
+  }
+  const teams = state.teams.map((team, index) =>
+    index === teamIndex ? { ...team, score: team.score + delta } : team,
+  )
+  return { ...state, teams }
+}
+
+/**
  * The subset of `roundResults` scored during turn `turn`, with the turn tag
  * stripped back off. `roundResults` on state accumulates every word played
  * all game; a game's `view()` uses this to show only the turn that is
