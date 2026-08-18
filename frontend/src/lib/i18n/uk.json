@@ -36,6 +36,7 @@
   "auth.upgradeButton": "Зберегти акаунт",
   "auth.upgradeSubmitting": "Зберігаємо...",
   "auth.upgradeError": "Не вдалося оновити акаунт. Спробуйте ще раз.",
+  "auth.sessionExpired": "Термін дії сесії закінчився. Увійдіть знову.",
   "room.createRoom": "Створити кімнату",
   "room.creatingRoom": "Створюємо...",
   "room.createError": "Не вдалося створити кімнату. Спробуйте ще раз.",

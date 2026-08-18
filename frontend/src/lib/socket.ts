@@ -32,12 +32,32 @@ export class SocketAckError extends Error {
  * membership (which the server forgets on a fresh handshake) is restored
  * after a reconnect.
  *
+ * Review finding (Task 21 fix-up): `auth` MUST be a function, not a plain
+ * object. Socket.IO calls a function `auth` fresh on every single connect
+ * AND reconnect attempt (`Socket.onopen()` in socket.io-client); a plain
+ * `{ token }` object is captured once, at this call, and is replayed
+ * unchanged on every future reconnect for the socket's entire lifetime. With
+ * `JWT_ACCESS_TTL` at 15 minutes, any reconnect after that window -- a sleep,
+ * a network blip, a suspended tab -- would replay an already-expired token,
+ * which `RealtimeGateway.authenticate` rejects, and a rejected handshake
+ * never even reaches `room-store.ts`'s `connect`/`disconnect` listeners
+ * (Socket.IO's own reconnection backoff is what's driving these attempts,
+ * not a JS timer this module owns). `getToken` is called by socket.io-client
+ * itself at that moment, so it always hands over whatever `room-store.ts`'s
+ * `connect_error` handler most recently refreshed -- see that file for the
+ * other half of this fix (refreshing the token and giving up gracefully
+ * when the refresh itself is rejected).
+ *
  * This is a plain factory, not a singleton -- see room-store.ts for the
  * "one socket per session" lifecycle decision (a module-level singleton
- * inside the store, not one per component/page). */
-export function createSocket(token: string): AppSocket {
+ * inside the store, not one per component/page). Deliberately takes a
+ * token GETTER rather than importing the auth store directly, so this file
+ * stays a plain Socket.IO wrapper with no store/React dependency of its
+ * own -- room-store.ts (which already owns the auth store dependency) is
+ * the only caller. */
+export function createSocket(getToken: () => string): AppSocket {
   return io(`${WS_URL}${SOCKET_NAMESPACE}`, {
-    auth: { token },
+    auth: (cb) => cb({ token: getToken() }),
     reconnection: true,
   })
 }

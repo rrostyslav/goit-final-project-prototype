@@ -13,6 +13,7 @@ import type {
   VoiceCredentials,
 } from '@gp/shared'
 import { create } from 'zustand'
+import { refreshAccessToken } from '../api'
 import { type AppSocket, createSocket, SocketAckError } from '../socket'
 import { useAuthStore } from './auth-store'
 
@@ -156,7 +157,10 @@ function ensureSocket(): AppSocket {
   if (!token) {
     throw new Error('Cannot open a realtime connection while signed out')
   }
-  const s = createSocket(token)
+  // Reads the store fresh on every (re)connect attempt -- see socket.ts's
+  // own doc comment on `createSocket` for why a plain captured string here
+  // was the Task 21 review finding's root cause.
+  const s = createSocket(() => useAuthStore.getState().accessToken ?? '')
   attachListeners(s)
   socket = s
   return s
@@ -194,6 +198,18 @@ function attachListeners(s: AppSocket): void {
     useRoomStore.setState({ socketConnected: false })
   })
 
+  // Review finding (Task 21 fix-up): a handshake rejected for an expired
+  // access token (the common case once `JWT_ACCESS_TTL`, 15 minutes,
+  // elapses on an otherwise-idle socket) used to retry forever with the
+  // SAME stale token -- socket.ts's `auth` becoming a function fixes
+  // reconnects that happen AFTER some other REST call has already
+  // refreshed the store's token, but an idle session with no REST traffic
+  // needs this handler to actually trigger that refresh itself. See
+  // `handleConnectError` below for the recovery/give-up logic.
+  s.on('connect_error', () => {
+    void handleConnectError(s)
+  })
+
   s.on('room:state', (dto) => useRoomStore.setState({ room: dto }))
   s.on('room:votes', (votes) => useRoomStore.setState({ votes }))
   s.on('chat:message', (message) =>
@@ -222,6 +238,85 @@ function attachListeners(s: AppSocket): void {
   // screens are the real audience -- so this only guards against an
   // unhandled 'error' listener taking the whole app down.
   s.on('error', () => {})
+}
+
+/** Review finding (Task 21 fix-up): recovers from a rejected handshake, or
+ * gives up cleanly instead of leaving Socket.IO's own reconnection backoff
+ * spinning against the server forever.
+ *
+ * `connect_error` fires for two very different reasons and this handler
+ * must tell them apart:
+ *   1. A genuine namespace rejection (`RealtimeGateway.authenticate` threw
+ *      -- expired/invalid token). Socket.IO has ALREADY given up its own
+ *      retry loop by the time this fires (a rejected namespace handshake
+ *      destroys the client-side namespace socket, which -- being the only
+ *      namespace this app ever opens -- tears down the whole Manager with
+ *      `skipReconnect: true`); nothing will retry unless this handler
+ *      explicitly calls `s.connect()` again.
+ *   2. A low-level transport failure (offline, DNS, a proxy blip) with a
+ *      still-valid token. Socket.IO's own backoff is still running in this
+ *      case and needs no help from here.
+ * Both look identical from this listener alone, so it always attempts the
+ * SAME shared refresh (`refreshAccessToken`, api.ts's own 401-retry path --
+ * no second refresh implementation) and then branches on the outcome:
+ *   - New token: no longer distinguishes the two cases at all --
+ *     reconnecting is safe and correct either way, so just do it.
+ *   - No token, but the store still has one: the refresh call itself
+ *     couldn't complete (case 2) -- `doRefresh` in api.ts only clears the
+ *     session on an explicit non-2xx response, never on a network
+ *     exception -- so leave Socket.IO's still-running backoff alone.
+ *   - No token, and the store's is gone too: `doRefresh` got an explicit
+ *     rejection and already cleared the session -- the refresh token
+ *     itself is invalid, not just the access token, so there is nothing
+ *     left to retry with. Stop for good and surface a translated
+ *     "sign in again" state instead of a banner that spins forever.
+ */
+async function handleConnectError(s: AppSocket): Promise<void> {
+  const token = await refreshAccessToken()
+  if (token) {
+    if (!s.connected) s.connect()
+    return
+  }
+  if (!useAuthStore.getState().accessToken) {
+    s.io.reconnection(false)
+    s.disconnect()
+    useAuthStore.getState().markSessionExpired()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session end: close the socket when the user's session goes away
+//
+// Review finding (Task 21 fix-up): `auth-store.ts`'s `logout` has no way to
+// reach the socket directly -- importing this module there would be exactly
+// the circular dependency this module's own header comment warns about (the
+// store already depends on auth-store.ts, not the other way around). Solved
+// from THIS side instead: this module already imports `useAuthStore`, so it
+// subscribes to it and reacts whenever `user` transitions from signed-in to
+// signed-out -- logout, or `markSessionExpired` above after a failed
+// refresh. No new import anywhere, no cycle.
+// ---------------------------------------------------------------------------
+
+useAuthStore.subscribe((state, prevState) => {
+  if (prevState.user && !state.user) {
+    closeSocket()
+  }
+})
+
+/** Also resets the module-level socket/listener bookkeeping (not just the
+ * live connection) so a subsequent login -- same tab, e.g. the guest
+ * upgrade or a plain re-login after `sessionExpired` -- gets a genuinely
+ * fresh `ensureSocket()` rather than reusing this now-disconnected
+ * instance forever. Room state is cleared too: it belongs to the session
+ * that just ended, and must not leak into whichever session (possibly a
+ * different user, on a shared tab) opens next. */
+function closeSocket(): void {
+  useRoomStore.setState({ ...initialState })
+  if (!socket) return
+  socket.io.reconnection(false)
+  socket.disconnect()
+  socket = null
+  listenersAttached = false
 }
 
 export const useRoomStore = create<RoomState>((set, get) => ({

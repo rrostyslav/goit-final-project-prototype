@@ -15,6 +15,7 @@ import { Card } from '@/components/ui/card'
 import { ApiError, api } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 import { sanitizeRoomCode } from '@/lib/room-code'
+import { SocketAckError } from '@/lib/socket'
 import { useAuthStore } from '@/lib/stores/auth-store'
 import { useRoomStore } from '@/lib/stores/room-store'
 
@@ -37,6 +38,7 @@ export default function RoomPage() {
 
   const user = useAuthStore((s) => s.user)
   const hasHydrated = useAuthStore((s) => s.hasHydrated)
+  const sessionExpired = useAuthStore((s) => s.sessionExpired)
 
   const room = useRoomStore((s) => s.room)
   const standings = useRoomStore((s) => s.standings)
@@ -69,7 +71,21 @@ export default function RoomPage() {
         await join(dto.id)
       } catch (err) {
         if (cancelled) return
-        setResolveError(err instanceof ApiError ? err.message : t('room.notFound'))
+        // Review finding (Task 21 fix-up): a banned user navigating straight
+        // back to the room URL resolves the code fine (REST 200) and only
+        // fails at `join()`, over the socket -- `ApiError` never applies
+        // here, so this fell through to the generic `room.notFound` even
+        // though the server said exactly why (`SocketAckError`'s `code`,
+        // `ROOM_BANNED` -- see `RoomBannedError`/`toErrorPayload` in
+        // realtime.gateway.ts). Give that one case its own translated
+        // message instead of the misleading "room not found".
+        if (err instanceof ApiError) {
+          setResolveError(err.message)
+        } else if (err instanceof SocketAckError && err.code === 'ROOM_BANNED') {
+          setResolveError(t('room.kickedBanned'))
+        } else {
+          setResolveError(t('room.notFound'))
+        }
       }
     }
     void run()
@@ -101,6 +117,26 @@ export default function RoomPage() {
 
   if (!hasHydrated) {
     return <LoadingShell />
+  }
+
+  // Review finding (Task 21 fix-up): checked before the plain `!user` case
+  // below so a realtime reconnect whose own token refresh was rejected
+  // (room-store.ts's `connect_error` handling -> `markSessionExpired`, which
+  // also clears `user`) reads as "your session expired, sign in again"
+  // rather than the generic "log in to join this room" -- same card shape,
+  // different translated copy and no `<VoicePanel/>`/`<ChatPanel/>` involved
+  // either way, since both branches return before that JSX.
+  if (sessionExpired) {
+    return (
+      <PageShell>
+        <Card className="flex w-full max-w-sm flex-col items-center gap-3 text-center">
+          <p className="text-sm text-danger">{t('auth.sessionExpired')}</p>
+          <Link href="/login">
+            <Button>{t('nav.login')}</Button>
+          </Link>
+        </Card>
+      </PageShell>
+    )
   }
 
   if (!user) {

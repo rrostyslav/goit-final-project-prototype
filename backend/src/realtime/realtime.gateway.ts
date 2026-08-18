@@ -222,6 +222,15 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       if (drawContext) {
         socket.emit('draw:sync', await this.drawingService.getAll(roomId))
       }
+      // Review finding (Task 21 fix-up): a member who joins (or reconnects)
+      // after votes were already cast used to see no tally at all until the
+      // next `room:vote_game` broadcast — this catches this socket up
+      // immediately, the same way the `draw:sync` above already does for
+      // the drawing channel. Same shape as the broadcast in `onVoteGame`/
+      // `handleMemberRemoved` (`Record<string, PlayerId[]>`, gameId ->
+      // voter ids) — sent only to the joining socket, not re-broadcast to
+      // the room, since nobody else's tally changed.
+      socket.emit('room:votes', await this.getVotes(roomId))
       return dto
     })
   }

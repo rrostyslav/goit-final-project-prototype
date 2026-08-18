@@ -58,9 +58,16 @@ interface RefreshResponse {
 // "refresh storm". The module-level variable is reset once the refresh
 // settles, so the NEXT 401 (later, once the new token also expires) starts
 // a fresh attempt rather than reusing a stale resolved promise.
+//
+// Exported so the realtime socket layer (room-store.ts's `connect_error`
+// handling -- see that file) can reuse this EXACT path -- same dedup, same
+// cookie-scoped refresh call, same `setSession`/`clearSession` outcome --
+// instead of growing a second, divergent refresh implementation for the
+// socket handshake. Returns the same in-flight promise to a concurrent REST
+// 401 and a concurrent socket reconnect alike.
 let refreshInFlight: Promise<string | null> | null = null
 
-function refreshAccessToken(): Promise<string | null> {
+export function refreshAccessToken(): Promise<string | null> {
   if (!refreshInFlight) {
     refreshInFlight = doRefresh().finally(() => {
       refreshInFlight = null

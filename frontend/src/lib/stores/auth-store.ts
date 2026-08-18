@@ -18,6 +18,16 @@ interface AuthState extends PersistedAuthState {
    * was found) re-validated it against the backend. Callers must gate any
    * "you are logged out" UI on this flag -- see hydrate() below. */
   hasHydrated: boolean
+  /** Review finding (Task 21 fix-up): set only when a realtime reconnect's
+   * OWN token refresh comes back rejected (see room-store.ts's
+   * `connect_error` handling) -- deliberately distinct from the plain
+   * "signed out" state (`user === null` with `sessionExpired === false`,
+   * e.g. a fresh visitor who never logged in) so `/room/[code]` can show a
+   * translated "your session expired, sign in again" message instead of
+   * the generic login prompt. Reset to `false` by every action below that
+   * establishes a fresh session, so it can never leak into a later,
+   * legitimately-logged-out-but-not-expired render. */
+  sessionExpired: boolean
   loginAsGuest: (nickname: string) => Promise<void>
   login: (email: string, password: string) => Promise<void>
   register: (email: string, password: string, nickname: string) => Promise<void>
@@ -34,6 +44,12 @@ interface AuthState extends PersistedAuthState {
    * update the session after a successful silent refresh. */
   setSession: (user: PublicUser, accessToken: string) => void
   clearSession: () => void
+  /** Room-store.ts's `connect_error` handling calls this -- and only this,
+   * never `clearSession` -- when the realtime socket's own token refresh
+   * is itself rejected, so the UI can tell that case apart from an
+   * ordinary logout/never-logged-in-yet state (see `sessionExpired`'s own
+   * doc comment above). */
+  markSessionExpired: () => void
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -42,18 +58,20 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       accessToken: null,
       hasHydrated: false,
+      sessionExpired: false,
 
-      setSession: (user, accessToken) => set({ user, accessToken }),
+      setSession: (user, accessToken) => set({ user, accessToken, sessionExpired: false }),
       clearSession: () => set({ user: null, accessToken: null }),
+      markSessionExpired: () => set({ user: null, accessToken: null, sessionExpired: true }),
 
       loginAsGuest: async (nickname) => {
         const data = await api.post<AuthResponse>('/auth/guest', { nickname })
-        set({ user: data.user, accessToken: data.accessToken })
+        set({ user: data.user, accessToken: data.accessToken, sessionExpired: false })
       },
 
       login: async (email, password) => {
         const data = await api.post<AuthResponse>('/auth/login', { email, password })
-        set({ user: data.user, accessToken: data.accessToken })
+        set({ user: data.user, accessToken: data.accessToken, sessionExpired: false })
       },
 
       register: async (email, password, nickname) => {
@@ -62,19 +80,19 @@ export const useAuthStore = create<AuthState>()(
           password,
           nickname,
         })
-        set({ user: data.user, accessToken: data.accessToken })
+        set({ user: data.user, accessToken: data.accessToken, sessionExpired: false })
       },
 
       upgrade: async (email, password) => {
         const data = await api.post<AuthResponse>('/auth/upgrade', { email, password })
-        set({ user: data.user, accessToken: data.accessToken })
+        set({ user: data.user, accessToken: data.accessToken, sessionExpired: false })
       },
 
       logout: async () => {
         try {
           await api.post('/auth/logout')
         } finally {
-          set({ user: null, accessToken: null })
+          set({ user: null, accessToken: null, sessionExpired: false })
         }
       },
 

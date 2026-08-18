@@ -36,6 +36,7 @@
   "auth.upgradeButton": "Save account",
   "auth.upgradeSubmitting": "Saving...",
   "auth.upgradeError": "Could not upgrade the account. Please try again.",
+  "auth.sessionExpired": "Your session has expired. Please sign in again.",
   "room.createRoom": "Create room",
   "room.creatingRoom": "Creating...",
   "room.createError": "Could not create a room. Please try again.",
