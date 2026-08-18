@@ -1,4 +1,11 @@
-import type { GameId, RoomDto, RoomStatus, ServerToClientEvents, WordGameView } from '@gp/shared'
+import type {
+  CardGameView,
+  GameId,
+  RoomDto,
+  RoomStatus,
+  ServerToClientEvents,
+  WordGameView,
+} from '@gp/shared'
 import { BadRequestException, ForbiddenException } from '@nestjs/common'
 import type { GameResult } from '../src/database/models/game-result.model'
 import type { GameSession } from '../src/database/models/game-session.model'
@@ -289,6 +296,12 @@ function wordView(payload: unknown): WordGameView {
   return payload as WordGameView
 }
 
+function cardView(payload: unknown): CardGameView {
+  const view = payload as { kind: string }
+  if (view.kind !== 'card') throw new Error('expected a card game view')
+  return payload as CardGameView
+}
+
 /** Reaches into the raw (not `view()`-shaped) Alias state persisted by
  * `runtime.snapshot()` to read the active team's score directly — this is
  * deliberately the *server-authoritative* value (what actually got written
@@ -336,6 +349,17 @@ function latestGameState(gateway: { emitted: EmittedEntry[] }, playerId: string)
     .find((e) => e.event === 'game:state' && e.userId === playerId)
   if (!entry) throw new Error(`expected a game:state emitted to ${playerId}`)
   return wordView(entry.payload)
+}
+
+/** Same lookup as `latestGameState`, for a card game's `CardGameView`
+ * instead of a word game's `WordGameView` -- used by the reconnect/join
+ * tests below, which cover Durak (a card game) alongside Alias. */
+function latestCardState(gateway: { emitted: EmittedEntry[] }, playerId: string): CardGameView {
+  const entry = [...gateway.emitted]
+    .reverse()
+    .find((e) => e.event === 'game:state' && e.userId === playerId)
+  if (!entry) throw new Error(`expected a game:state emitted to ${playerId}`)
+  return cardView(entry.payload)
 }
 
 function currentExplainer(gateway: { emitted: EmittedEntry[] }, anyPlayer: string): string {
@@ -604,6 +628,29 @@ describe('GameRuntimeService', () => {
   })
 })
 
+/** Starts a 4-player Alias room and drives it to "explainer mid-turn, clock
+ * running" — the shared starting point for both the original pause/resume
+ * tests below and this task's reconnect/join `game:state`-push tests, which
+ * both need an active word game with a known explainer and a known
+ * non-explainer. Module-scoped (not nested in one `describe`) so both blocks
+ * can call it. */
+async function startedAliasRoom() {
+  const ctx = createRuntime({
+    id: 'room1',
+    hostId: 'host',
+    memberIds: ['host', 'g1', 'g2', 'g3'],
+    selectedGameId: 'alias',
+    status: 'lobby',
+  })
+  await ctx.runtime.start('room1', 'host')
+  const sessionId = sessionIdFrom(ctx.gateway)
+  const explainerId = currentExplainer(ctx.gateway, 'host')
+  await ctx.runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+  const notExplainer = ['host', 'g1', 'g2', 'g3'].find((p) => p !== explainerId)
+  if (!notExplainer) throw new Error('expected a non-explainer player')
+  return { ...ctx, sessionId, explainerId, notExplainer }
+}
+
 // ---------------------------------------------------------------------------
 // Review finding: pauseForDisconnect / resumeAfterReconnect had zero unit
 // coverage. Both are gated on `isWaitingOn(view, userId)` — the first draft
@@ -613,23 +660,6 @@ describe('GameRuntimeService', () => {
 // regressing. These cases lock the gating in for both directions.
 // ---------------------------------------------------------------------------
 describe('GameRuntimeService pause/resume (disconnect/reconnect)', () => {
-  async function startedAliasRoom() {
-    const ctx = createRuntime({
-      id: 'room1',
-      hostId: 'host',
-      memberIds: ['host', 'g1', 'g2', 'g3'],
-      selectedGameId: 'alias',
-      status: 'lobby',
-    })
-    await ctx.runtime.start('room1', 'host')
-    const sessionId = sessionIdFrom(ctx.gateway)
-    const explainerId = currentExplainer(ctx.gateway, 'host')
-    await ctx.runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
-    const notExplainer = ['host', 'g1', 'g2', 'g3'].find((p) => p !== explainerId)
-    if (!notExplainer) throw new Error('expected a non-explainer player')
-    return { ...ctx, sessionId, explainerId, notExplainer }
-  }
-
   it('a disconnect by the explainer the game is waiting on pauses the round', async () => {
     const { runtime, sessionId, explainerId } = await startedAliasRoom()
 
@@ -697,6 +727,87 @@ describe('GameRuntimeService pause/resume (disconnect/reconnect)', () => {
     // Same deadline, not a freshly-computed one — `resumeWordTurn` no-ops
     // whenever there is nothing banked in `pausedRemainingMs` to restore.
     expect(after).toEqual(before)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review finding (this task): `resumeAfterReconnect` gated its ONLY
+// proactive `game:state` push behind `definition.resume`. Durak/Nine have no
+// round clock, so neither defines `pause`/`resume` — a reconnecting or
+// joining player in an active Durak/Nine session used to receive nothing at
+// all and would sit on a placeholder screen forever (in a 2-player Durak
+// game where it is that player's turn, this is a permanent stall: nobody
+// else can act). Word games had a narrower version of the same bug: a
+// reconnecting player who was not the one the game was currently "waiting
+// on" (see `isWaitingOn`) also received nothing, since the old code only
+// broadcast as a side effect of the `resume`-and-`isWaitingOn`-gated branch.
+// Fixed by splitting "push this player's own current view" (now
+// unconditional — gated only on "are they part of this session at all") from
+// "resume a paused clock" (still gated on `resume`+`isWaitingOn`, unchanged).
+// `RealtimeGateway.onRoomJoin` calls `resumeAfterReconnect` for EVERY
+// `room:join` — both a genuine reconnect and an ordinary first join for a
+// player already part of a running session funnel through this one method —
+// so these tests exercise both paths directly against `GameRuntimeService`.
+// ---------------------------------------------------------------------------
+describe('GameRuntimeService reconnect/join always pushes game:state (review fix)', () => {
+  async function startedDurakRoom() {
+    const ctx = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1'],
+      selectedGameId: 'durak',
+      status: 'lobby',
+    })
+    await ctx.runtime.start('room1', 'host')
+    return ctx
+  }
+
+  it('a player reconnecting during an active Durak session receives a game:state addressed to them', async () => {
+    const { runtime, gateway } = await startedDurakRoom()
+    // Durak defines neither `pause` nor `resume` (no round clock) — before
+    // the fix, `doResumeAfterReconnect` returned immediately on
+    // `!loaded?.definition.resume` and never pushed anything.
+    gateway.emitted.length = 0
+
+    await runtime.resumeAfterReconnect('room1', 'g1')
+
+    const pushed = latestCardState(gateway, 'g1')
+    expect(pushed.gameId).toBe('durak')
+    expect(pushed.kind).toBe('card')
+  })
+
+  it('a player reconnecting during an active Alias session still both resumes the paused clock and receives their state', async () => {
+    const { runtime, sessionId, explainerId, gateway } = await startedAliasRoom()
+    await runtime.pauseForDisconnect('room1', explainerId)
+    const paused = readRoundClock(await runtime.snapshot(sessionId))
+    expect(paused.roundEndsAt).toBeNull()
+    gateway.emitted.length = 0
+
+    await runtime.resumeAfterReconnect('room1', explainerId)
+
+    // The clock-resume behaviour is exactly what it was before this fix.
+    const afterClock = readRoundClock(await runtime.snapshot(sessionId))
+    expect(afterClock.roundEndsAt).not.toBeNull()
+    expect(afterClock.pausedRemainingMs).toBeNull()
+
+    // ...and, separately, the reconnecting player received their own state.
+    const pushed = latestGameState(gateway, explainerId)
+    expect(pushed.roundPaused).toBe(false)
+  })
+
+  it('a player joining a room with a game already in progress receives their state', async () => {
+    const { runtime, gateway, notExplainer } = await startedAliasRoom()
+    // `notExplainer` was never disconnected/paused — this models an
+    // ordinary `room:join` for a player who was already part of the room
+    // when the game started, not a reconnect-after-pause. Before the fix,
+    // `isWaitingOn` was false for them (they are not the current explainer),
+    // so the old code returned without pushing anything.
+    gateway.emitted.length = 0
+
+    await runtime.resumeAfterReconnect('room1', notExplainer)
+
+    const pushed = latestGameState(gateway, notExplainer)
+    expect(pushed.kind).toBe('word')
   })
 })
 

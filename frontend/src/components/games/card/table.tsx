@@ -2,7 +2,7 @@
 
 import type { Card as CardData, CardGameView, Suit } from '@gp/shared'
 import { useI18n } from '@/lib/i18n'
-import { cardKey, PlayingCard } from './playing-card'
+import { cardKey, PlayingCard, SUIT_GLYPH } from './playing-card'
 
 export interface TableProps {
   view: CardGameView
@@ -18,7 +18,6 @@ export interface TableProps {
 }
 
 const SUIT_ORDER: Suit[] = ['spades', 'hearts', 'diamonds', 'clubs']
-const SUIT_GLYPH: Record<Suit, string> = { spades: '♠', hearts: '♥', diamonds: '♦', clubs: '♣' }
 
 /**
  * The shared table area for both card games -- branches on `view.gameId`

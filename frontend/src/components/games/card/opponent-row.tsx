@@ -72,9 +72,11 @@ export function OpponentRow({
   )
 }
 
-/** A single decorative face-down back -- deliberately not `<PlayingCard
- * faceDown/>`, which requires a real `Card` (there is no card to give it
- * here, only a count; see the component doc comment above). */
+/** A single decorative face-down back -- deliberately not `<PlayingCard/>`
+ * (which always requires a real `Card` and renders at hand/table size),
+ * since there is no card to give it here, only a count, and this badge is
+ * intentionally smaller than a real card (see the component doc comment
+ * above). */
 function CardBack() {
   return (
     <div

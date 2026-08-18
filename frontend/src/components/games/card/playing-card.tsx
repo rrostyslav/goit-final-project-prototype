@@ -5,11 +5,6 @@ import { cn } from '@/lib/cn'
 
 export interface PlayingCardProps {
   card: CardData
-  /** Renders a plain card back instead of `card`'s rank/suit -- used for
-   * opponents' hands, which `CardGameView` never discloses (see
-   * `CardOpponentView`'s doc comment in `@gp/shared`: only a `cardCount`).
-   * Never interactive, regardless of `onClick`. */
-  faceDown?: boolean
   /** Omit entirely for a purely decorative, non-clickable card (the trump
    * display, an already-defended table entry, a table attack the viewer
    * isn't the defender for). Present only when this exact card is currently
@@ -33,8 +28,9 @@ export interface PlayingCardProps {
 /** The glyph is the PRIMARY signal for telling suits apart -- all four are
  * unambiguous shapes even with colour removed entirely. `SUIT_COLOR` below
  * is a secondary reinforcement only (the classic two-colour deck
- * convention), never the sole way to distinguish a card. */
-const SUIT_GLYPH: Record<Suit, string> = {
+ * convention), never the sole way to distinguish a card. Exported so
+ * `table.tsx` shares this one definition instead of keeping its own copy. */
+export const SUIT_GLYPH: Record<Suit, string> = {
   spades: '♠',
   hearts: '♥',
   diamonds: '♦',
@@ -48,6 +44,12 @@ const SUIT_COLOR: Record<Suit, string> = {
   diamonds: 'text-red-600',
 }
 
+/** A plain `Record`, not `Object.fromEntries`/derived keys, is deliberate:
+ * unlike suits (an arbitrary 4-way enum with no inherent text form), ranks
+ * 6-10 are already their own label (`String(rank)`) and J/Q/K/A are a
+ * universal convention as fixed as decimal digits -- there is no dictionary
+ * this could sensibly key into, so spelling all nine mappings out here is
+ * the actual choice, not an oversight. */
 const RANK_LABEL: Record<Rank, string> = {
   6: '6',
   7: '7',
@@ -73,28 +75,11 @@ const CARD_FACE_CLASSES =
 
 export function PlayingCard({
   card,
-  faceDown = false,
   onClick,
   selected = false,
   disabled = false,
   className,
 }: PlayingCardProps) {
-  if (faceDown) {
-    return (
-      <div
-        aria-hidden="true"
-        className={cn(
-          'h-24 w-16 shrink-0 rounded-lg border-2 border-border bg-primary shadow-md',
-          className,
-        )}
-        style={{
-          backgroundImage:
-            'repeating-linear-gradient(45deg, rgba(255,255,255,0.14) 0 6px, transparent 6px 12px)',
-        }}
-      />
-    )
-  }
-
   const interactive = onClick !== undefined && !disabled
   const label = RANK_LABEL[card.rank]
   const glyph = SUIT_GLYPH[card.suit]

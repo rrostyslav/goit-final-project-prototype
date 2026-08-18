@@ -433,22 +433,67 @@ export class GameRuntimeService implements OnModuleDestroy {
     )
   }
 
+  /**
+   * Review finding: this method used to be the ONLY place that proactively
+   * pushes `game:state` outside of `applyEffect`, and it only did so as a
+   * side effect of the `resume` branch below (gated on `definition.resume`
+   * existing AND `isWaitingOn`) — so a game with no `pause`/`resume` pair
+   * (Durak, Nine: no round clock, nothing to resume) never pushed anything
+   * at all on join/reconnect, leaving that player on whatever placeholder
+   * screen the client shows before its first `game:state`. In a 2-player
+   * Durak game where it was the reconnecting player's turn, that is a
+   * permanent stall — nobody else can act. Word games had a narrower version
+   * of the same gap: a reconnecting player who wasn't the one the game was
+   * "waiting on" (e.g. reconnecting while a teammate is explaining) also
+   * received nothing.
+   *
+   * Fixed by splitting the two concerns this method actually has: "resume a
+   * paused clock" (word games only, unchanged below) and "push this player's
+   * current view" (now always happens). The push is written as a fallback —
+   * only reached when the resume branch does NOT already cover it — rather
+   * than an unconditional statement run before it: `applyEffect` (called
+   * from the resume branch) already broadcasts this player's own fresh,
+   * POST-resume view as part of its normal per-player fan-out, so pushing a
+   * second, PRE-resume view first would let a `waitFor(socket, 'game:state')`
+   * -style client see the stale still-paused view before the resumed one —
+   * a real regression this ordering caught live (see this task's fix
+   * report). `onRoomJoin` calls this method for every `room:join` — a
+   * genuine reconnect and an ordinary first join both funnel through here —
+   * so fixing it here covers both paths.
+   */
   private async doResumeAfterReconnect(roomId: RoomId, userId: UserId): Promise<void> {
     const loaded = await this.tryLoadActiveGame(roomId)
-    if (!loaded?.definition.resume) return
+    if (!loaded) return
 
-    // Gated the same way as pauseForDisconnect, on purpose: `view()` still
-    // reports the paused turn's explainer as `explainerId` (pausing only
-    // touches the round's clock, not who is explaining), so this correctly
-    // resumes only when the RECONNECTING player is the one the game was
-    // actually waiting on — not on every unrelated join/reconnect in the
-    // room, which would otherwise resume a turn while the player it is
-    // actually waiting on is still disconnected.
-    const view = loaded.definition.view(loaded.state, userId)
-    if (!this.isWaitingOn(view, userId)) return
+    if (loaded.definition.resume) {
+      // Gated the same way as pauseForDisconnect, on purpose: `view()` still
+      // reports the paused turn's explainer as `explainerId` (pausing only
+      // touches the round's clock, not who is explaining), so this
+      // correctly resumes only when the RECONNECTING player is the one the
+      // game was actually waiting on — not on every unrelated join/reconnect
+      // in the room, which would otherwise resume a turn while the player it
+      // is actually waiting on is still disconnected.
+      const view = loaded.definition.view(loaded.state, userId)
+      if (this.isWaitingOn(view, userId)) {
+        const effect = loaded.definition.resume(loaded.state, this.now())
+        await this.applyEffect(loaded, effect)
+        return
+      }
+    }
 
-    const effect = loaded.definition.resume(loaded.state, this.now())
-    await this.applyEffect(loaded, effect)
+    // Reached whenever the block above did not already push a fresh view to
+    // this player: either this game defines no `pause`/`resume` pair at all
+    // (Durak, Nine), or it does but this player wasn't the one being waited
+    // on. Only pushes to players actually part of this session — a room
+    // member who joins after the game already started without being one of
+    // its `playerIds` has nothing of this game to view.
+    if (loaded.playerIds.includes(userId)) {
+      await this.requireGateway().emitToUser(
+        userId,
+        'game:state',
+        loaded.definition.view(loaded.state, userId),
+      )
+    }
   }
 
   /** Called by `RealtimeGateway.handleMemberRemoved` once a room's member
