@@ -50,7 +50,7 @@ jobs:
     name: Build, push to ECR, bump chart
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Full history, not the default shallow depth-1 clone: the
           # "commit the chart bump back" step below does `git pull --rebase`
@@ -71,19 +71,19 @@ jobs:
       # a literal so nothing here has to change once it does.
       # ---------------------------------------------------------------
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build and push backend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: backend/Dockerfile
@@ -93,7 +93,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Bump charts/backend-api/values.yaml image.tag
-        uses: mikefarah/yq@v4.44.3
+        uses: mikefarah/yq@bbdd97482f2d439126582a59689eb1c855944955 # v4.44.3
         with:
           cmd: yq -i '.image.tag = "${{ github.sha }}"' charts/backend-api/values.yaml
 
