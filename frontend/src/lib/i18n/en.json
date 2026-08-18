@@ -1,0 +1,33 @@
+{
+  "meta.title": "Game Platform",
+  "meta.description": "Persistent voice-chat rooms and mini-games for friends, in the browser.",
+
+  "app.heroTitle": "Play together. Voice included.",
+  "app.heroBody": "Create a room, bring your friends into voice chat, and play Alias, Hat, Crocodile, Durak or Nine — right in the browser.",
+  "app.featureVoice": "Voice chat in every room",
+  "app.featureGames": "Five mini-games to choose from",
+  "app.featureRooms": "Join by code — instant access",
+
+  "auth.nicknameLabel": "Nickname",
+  "auth.nicknamePlaceholder": "Enter a nickname",
+  "auth.nicknameRequired": "Enter a nickname to continue",
+  "auth.playAsGuest": "Play as guest",
+  "auth.playingAsGuest": "Signing in...",
+  "auth.guestError": "Could not sign in. Please try again.",
+
+  "room.createRoom": "Create room",
+  "room.creatingRoom": "Creating...",
+  "room.createError": "Could not create a room. Please try again.",
+  "room.joinTitle": "Join with a code",
+  "room.codeLabel": "Room code",
+  "room.codePlaceholder": "ABC123",
+  "room.join": "Join",
+  "room.codeInvalidLength": "Room code must be 6 characters",
+
+  "nav.localeUk": "Українська",
+  "nav.localeEn": "English",
+
+  "common.loggedInAs": "Signed in as {nickname}",
+  "common.logout": "Log out",
+  "common.close": "Close"
+}
