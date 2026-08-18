@@ -9,13 +9,13 @@ on:
   push:
     branches: [main]
 
-# A second push to the same branch/PR while a run is still in flight cancels
-# the stale one — no reason to keep burning minutes validating a commit
-# that's already been superseded.
 # Read-only: this workflow never pushes and never assumes an AWS role.
 permissions:
   contents: read
 
+# A second push to the same branch/PR while a run is still in flight cancels
+# the stale one — no reason to keep burning minutes validating a commit
+# that's already been superseded.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
