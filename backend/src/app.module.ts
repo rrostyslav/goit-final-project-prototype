@@ -5,6 +5,7 @@ import { DatabaseModule } from './database/database.module'
 import { FriendsModule } from './friends/friends.module'
 import { HealthModule } from './health/health.module'
 import { NotificationsModule } from './notifications/notifications.module'
+import { RealtimeModule } from './realtime/realtime.module'
 import { RoomsModule } from './rooms/rooms.module'
 import { UsersModule } from './users/users.module'
 
@@ -18,6 +19,7 @@ import { UsersModule } from './users/users.module'
     FriendsModule,
     NotificationsModule,
     RoomsModule,
+    RealtimeModule,
   ],
 })
 export class AppModule {}

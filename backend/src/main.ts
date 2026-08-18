@@ -4,6 +4,8 @@ import { NestFactory } from '@nestjs/core'
 import cookieParser from 'cookie-parser'
 import { AppModule } from './app.module'
 import { AppConfigService } from './config/env.config'
+import { RedisIoAdapter } from './realtime/redis-io.adapter'
+import { RedisService } from './redis/redis.service'
 
 // Load a local .env file (if present) into process.env before the config
 // service parses it. In production/CI env vars are injected directly by the
@@ -26,6 +28,7 @@ async function bootstrap() {
   app.enableCors({ origin: config.corsOrigin, credentials: true })
   app.use(cookieParser())
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+  app.useWebSocketAdapter(new RedisIoAdapter(app, app.get(RedisService)))
 
   await app.listen(config.port)
 }

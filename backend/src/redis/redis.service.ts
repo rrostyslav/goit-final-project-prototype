@@ -1,18 +1,42 @@
+import { randomUUID } from 'node:crypto'
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common'
 import Redis from 'ioredis'
 import { AppConfigService } from '../config/env.config'
 
-// Minimal Redis wiring for Task 9's rate limiter. Task 15 extends this with
-// a `subscriber` connection and wires the Socket.IO Redis adapter on top —
-// keep this small and stable so that extension is additive, not a rewrite.
+const LOCK_KEY_PREFIX = 'lock:'
+const LOCK_TTL_MS = 10_000
+const LOCK_ACQUIRE_TIMEOUT_MS = 5_000
+const LOCK_RETRY_DELAY_MS = 50
+
+// Only releases the lock if it is still held by the caller that acquired
+// it (token match) — without this a slow caller whose lock already expired
+// could delete a different caller's now-active lock.
+const RELEASE_LOCK_SCRIPT = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end
+`
+
+// Minimal Redis wiring for Task 9's rate limiter, extended by Task 15 with
+// a dedicated `subscriber` connection (for the Socket.IO Redis adapter) and
+// a `withLock` helper (for serializing room mutations across gateway
+// instances) — additive on top of Task 9's `client` + `rateLimit`.
 @Injectable()
 export class RedisService implements OnModuleDestroy {
   private readonly logger = new Logger(RedisService.name)
 
   readonly client: Redis
+  /** Dedicated connection for the Socket.IO Redis adapter's subscribe side.
+   * Kept separate from `client` because a connection actively SUBSCRIBEd
+   * cannot issue ordinary commands — `client` remains free for `rateLimit`,
+   * `withLock` and the adapter's own publish side. */
+  readonly subscriber: Redis
 
   constructor(config: AppConfigService) {
     this.client = new Redis(config.redisUrl)
+    this.subscriber = this.client.duplicate()
   }
 
   /** Fixed-window rate limiter: allows up to `max` calls per `key` within a
@@ -40,7 +64,63 @@ export class RedisService implements OnModuleDestroy {
     }
   }
 
-  async onModuleDestroy(): Promise<void> {
-    await this.client.quit()
+  /** Best-effort distributed mutex: serializes concurrent callers across
+   * every gateway instance sharing the same `key` (callers pass a plain
+   * semantic key, e.g. `room:${roomId}`; this method adds the `lock:`
+   * namespace prefix itself). Mirrors `rateLimit`'s fail-open philosophy —
+   * if the lock cannot be acquired within `LOCK_ACQUIRE_TIMEOUT_MS` (heavy
+   * contention, or Redis itself unreachable), `fn` still runs rather than
+   * the caller hanging or the request failing outright; for a prototype-
+   * scale room action, a rare missed lock is a smaller problem than every
+   * room mutation becoming unavailable whenever Redis hiccups. */
+  async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const lockKey = `${LOCK_KEY_PREFIX}${key}`
+    const token = randomUUID()
+    const acquired = await this.acquireLock(lockKey, token)
+    try {
+      return await fn()
+    } finally {
+      if (acquired) {
+        await this.releaseLock(lockKey, token)
+      }
+    }
   }
+
+  private async acquireLock(lockKey: string, token: string): Promise<boolean> {
+    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS
+    try {
+      do {
+        const result = await this.client.set(lockKey, token, 'PX', LOCK_TTL_MS, 'NX')
+        if (result === 'OK') {
+          return true
+        }
+        await sleep(LOCK_RETRY_DELAY_MS)
+      } while (Date.now() < deadline)
+      this.logger.warn(`withLock: timed out acquiring lock "${lockKey}", proceeding without it`)
+      return false
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.logger.warn(
+        `withLock: Redis error acquiring lock "${lockKey}", proceeding without it: ${message}`,
+      )
+      return false
+    }
+  }
+
+  private async releaseLock(lockKey: string, token: string): Promise<void> {
+    try {
+      await this.client.eval(RELEASE_LOCK_SCRIPT, 1, lockKey, token)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.logger.warn(`withLock: failed to release lock "${lockKey}": ${message}`)
+    }
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await Promise.all([this.client.quit(), this.subscriber.quit()])
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
