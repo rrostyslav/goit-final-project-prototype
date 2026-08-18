@@ -30,6 +30,12 @@ async function bootstrap() {
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
   app.useWebSocketAdapter(new RedisIoAdapter(app, app.get(RedisService)))
 
+  // Without this, Nest never runs OnApplicationShutdown on SIGTERM — only on an
+  // explicit app.close(). RedisService closes its connections in that hook
+  // precisely so the socket.io adapter shuts down before them, so a pod getting
+  // SIGTERM from Kubernetes would otherwise skip that cleanup entirely.
+  app.enableShutdownHooks()
+
   await app.listen(config.port)
 }
 
