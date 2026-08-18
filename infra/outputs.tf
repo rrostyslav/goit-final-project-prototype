@@ -1,3 +1,18 @@
+output "cluster_name" {
+  description = "Name of the EKS cluster."
+  value       = module.eks.cluster_name
+}
+
+output "github_actions_role_arn" {
+  description = "ARN of the IAM role GitHub Actions assumes via OIDC to push images to ECR and describe the EKS cluster."
+  value       = module.ci_cd.role_arn
+}
+
+output "argocd_namespace" {
+  description = "Kubernetes namespace Argo CD is installed into."
+  value       = module.argo_cd.namespace
+}
+
 output "vpc_id" {
   description = "ID of the VPC."
   value       = module.vpc.vpc_id

@@ -7,14 +7,17 @@ aws_region  = "eu-central-1"
 
 vpc_cidr = "10.0.0.0/16"
 
-cluster_version   = "1.30"
-db_instance_class = "db.t4g.micro"
-redis_node_type   = "cache.t4g.micro"
+cluster_version         = "1.30"
+eks_node_instance_types = ["t3.medium"]
+db_instance_class       = "db.t4g.micro"
+redis_node_type         = "cache.t4g.micro"
 
-# "owner/repo" — scopes the GitHub Actions OIDC trust policy (Task 25).
+# "owner/repo" — scopes the GitHub Actions OIDC trust policy to
+# repo:<this>:ref:refs/heads/<github_branch> (see modules/ci-cd).
 github_repository = "your-org/your-repo"
+github_branch     = "main"
 
-# Leave null until modules/eks (Task 25) exists and outputs
-# node_security_group_id; wire that output through here (or directly into
-# modules/rds and modules/redis) once it does.
-eks_node_security_group_id = null
+# Git URL of this same repository — Argo CD's root Application tracks
+# charts/ here, on this branch.
+gitops_repo_url = "https://github.com/your-org/your-repo.git"
+gitops_branch   = "main"

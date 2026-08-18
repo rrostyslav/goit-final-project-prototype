@@ -27,9 +27,15 @@ variable "vpc_cidr" {
 }
 
 variable "cluster_version" {
-  description = "Kubernetes version for the EKS cluster (consumed by modules/eks in Task 25; declared here so the root variable surface is stable across tasks)."
+  description = "Kubernetes version for the EKS cluster."
   type        = string
   default     = "1.30"
+}
+
+variable "eks_node_instance_types" {
+  description = "EC2 instance types for the EKS managed node group. Prototype-scale default; size up for real load."
+  type        = list(string)
+  default     = ["t3.medium"]
 }
 
 variable "db_instance_class" {
@@ -45,23 +51,25 @@ variable "redis_node_type" {
 }
 
 variable "github_repository" {
-  description = "GitHub repository in \"owner/repo\" form, used to scope the GitHub Actions OIDC trust policy (consumed by modules/ci-cd in Task 25)."
+  description = "GitHub repository in \"owner/repo\" form, used to scope the GitHub Actions OIDC trust policy."
   type        = string
   default     = ""
 }
 
-variable "eks_node_security_group_id" {
-  description = <<-EOT
-    Security group ID of the EKS worker nodes. modules/rds and modules/redis
-    use this to scope their ingress rules to traffic from the cluster only.
-
-    modules/eks does not exist yet (it lands in Task 25 and will output
-    node_security_group_id). Until then this stays null, and the RDS/Redis
-    security groups are created with NO ingress rule at all — a safe,
-    fail-closed placeholder. Task 25 must wire this root variable (or the
-    eks module's output directly) into modules/rds and modules/redis so the
-    ingress rule is actually created.
-  EOT
+variable "github_branch" {
+  description = "Branch GitHub Actions deploy workflows push from. Scopes modules/ci-cd's OIDC trust policy to exactly this ref — see that module's github_branch variable description for why it isn't the broader \"any branch/PR\" wildcard."
   type        = string
-  default     = null
+  default     = "main"
+}
+
+variable "gitops_repo_url" {
+  description = "Git URL of the GitOps repository (this repository) Argo CD's root Application tracks."
+  type        = string
+  default     = ""
+}
+
+variable "gitops_branch" {
+  description = "Branch Argo CD's root Application syncs from."
+  type        = string
+  default     = "main"
 }
