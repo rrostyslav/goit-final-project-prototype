@@ -21,13 +21,9 @@ import type { Response } from 'express'
 import { CurrentUser } from '../auth/decorators/current-user.decorator'
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
 import { RedisService } from '../redis/redis.service'
-import { BanMemberDto } from './dto/ban-member.dto'
 import { BrowseRoomsDto } from './dto/browse-rooms.dto'
 import { CreateRoomDto } from './dto/create-room.dto'
 import { ReportRoomDto } from './dto/report-room.dto'
-import { SelectGameDto } from './dto/select-game.dto'
-import { SetReadyDto } from './dto/set-ready.dto'
-import { TargetMemberDto } from './dto/target-member.dto'
 import { RoomBannedError, RoomClosedError, RoomFullError, RoomsService } from './rooms.service'
 
 const RATE_LIMIT_KEY_PREFIX = 'ratelimit:room-create:'
@@ -123,55 +119,30 @@ export class RoomsController {
     return this.roomsService.leave(id, user.id)
   }
 
-  @Post(':id/ready')
-  @UseGuards(JwtAuthGuard)
-  setReady(
-    @CurrentUser() user: PublicUser,
-    @Param('id') id: string,
-    @Body() dto: SetReadyDto,
-  ): Promise<RoomDto> {
-    return this.roomsService.setReady(id, user.id, dto.isReady)
-  }
-
-  @Post(':id/select-game')
-  @UseGuards(JwtAuthGuard)
-  selectGame(
-    @CurrentUser() user: PublicUser,
-    @Param('id') id: string,
-    @Body() dto: SelectGameDto,
-  ): Promise<RoomDto> {
-    return this.roomsService.selectGame(id, user.id, dto.gameId)
-  }
-
-  @Post(':id/transfer-host')
-  @UseGuards(JwtAuthGuard)
-  transferHost(
-    @CurrentUser() user: PublicUser,
-    @Param('id') id: string,
-    @Body() dto: TargetMemberDto,
-  ): Promise<RoomDto> {
-    return this.roomsService.transferHost(id, user.id, dto.targetId)
-  }
-
-  @Post(':id/kick')
-  @UseGuards(JwtAuthGuard)
-  kick(
-    @CurrentUser() user: PublicUser,
-    @Param('id') id: string,
-    @Body() dto: TargetMemberDto,
-  ): Promise<RoomDto> {
-    return this.roomsService.kick(id, user.id, dto.targetId)
-  }
-
-  @Post(':id/ban')
-  @UseGuards(JwtAuthGuard)
-  ban(
-    @CurrentUser() user: PublicUser,
-    @Param('id') id: string,
-    @Body() dto: BanMemberDto,
-  ): Promise<RoomDto> {
-    return this.roomsService.ban(id, user.id, dto.targetId, dto.reason)
-  }
+  // Final-review finding B: `POST /:id/{ready,select-game,transfer-host,
+  // kick,ban}` used to live here, calling straight into `RoomsService` the
+  // same way `join`/`leave` above do. Unlike `join`/`leave`, those five are
+  // genuinely live-room MODERATION actions with a connected-socket side that
+  // a bare Postgres write can never satisfy: `kick`/`ban` must also
+  // disconnect the target's sockets and emit `room:kicked`, and every one of
+  // the five must `broadcastRoomState` so every other member's view stays
+  // current. `RealtimeGateway`'s `room:ready`/`room:select_game`/
+  // `room:transfer_host`/`room:kick`/`room:ban` handlers already do exactly
+  // that (see realtime.gateway.ts) — these REST routes were a second,
+  // parallel path into the SAME `RoomsService` methods that skipped all of
+  // it. Live-reproduced: a `POST /:id/ban` returned 201, but the banned
+  // user's socket was never touched — no `room:kicked`, no disconnect — so
+  // they stayed in the room's Socket.IO room and `room:chat` (which
+  // authorizes on `socket.rooms.has(roomId)`, not database membership) kept
+  // accepting their messages. The frontend never called any of these five
+  // routes (confirmed against every `api.*` call site under `frontend/src`
+  // — it only ever uses `POST /rooms`, `GET /rooms`, `GET /rooms/by-code/
+  // :code`, and the WS `room:*` events for everything moderation-related),
+  // so removed rather than fixed in place: the WS handlers are the one path
+  // that actually enforces this correctly, and duplicating that enforcement
+  // into a second REST entry point isn't worth the maintenance surface.
+  // `RoomsService.setReady`/`selectGame`/`transferHost`/`kick`/`ban`
+  // themselves are unchanged — `RealtimeGateway` is still their only caller.
 
   @Post(':id/report')
   @UseGuards(JwtAuthGuard)

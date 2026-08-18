@@ -5,6 +5,7 @@ import type {
   DrawStroke,
   GameAction,
   GameId,
+  Locale,
   PlayerId,
   PublicUser,
   RoomDto,
@@ -231,6 +232,22 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       // voter ids) — sent only to the joining socket, not re-broadcast to
       // the room, since nobody else's tally changed.
       socket.emit('room:votes', await this.getVotes(roomId))
+      // Final-review finding F: `game:ended` is push-only and the frontend
+      // resets `standings` on `game:started`/leave, so a socket that joins
+      // (a fresh join, or a reload — both come through here) while the room
+      // is still `results` used to render an empty standings list with
+      // nothing left to backfill it. Catches this socket up the same way
+      // `draw:sync`/`room:votes` already do above — reusing the exact
+      // `game:ended` shape the store already listens for, not a new event —
+      // whenever a standings snapshot from the game that just ended is still
+      // fresh (see `GameRuntimeService.getLastStandings`'s own doc comment
+      // for the TTL and cleanup).
+      if (dto.status === 'results') {
+        const last = await this.gameRuntimeService.getLastStandings(roomId)
+        if (last) {
+          socket.emit('game:ended', last)
+        }
+      }
       return dto
     })
   }
@@ -405,12 +422,12 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
   @SubscribeMessage('game:start')
   async onGameStart(
     @ConnectedSocket() socket: AppSocket,
-    @MessageBody() payload: { roomId: string },
+    @MessageBody() payload: { roomId: string; locale?: Locale },
   ): Promise<Ack<null>> {
     return this.handle(async () => {
       const roomId = assertNonEmptyString(payload.roomId, 'roomId')
       this.assertMember(socket, roomId)
-      await this.gameRuntimeService.start(roomId, socket.data.user.id)
+      await this.gameRuntimeService.start(roomId, socket.data.user.id, payload.locale)
       return null
     })
   }
@@ -697,7 +714,7 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
   async handleMemberRemoved(roomId: string, userId: string): Promise<RoomDto> {
     this.presenceService.cancelEviction(roomId, userId)
     await this.removeVote(roomId, userId)
-    const dto = await this.broadcastRoomState(roomId)
+    let dto = await this.broadcastRoomState(roomId)
     if (dto.members.length === 0) {
       await this.clearVotes(roomId)
       // A room that empties must not leave anything Task 16 owns lingering
@@ -705,6 +722,16 @@ export class RealtimeGateway implements OnGatewayInit<AppServer>, OnGatewayConne
       // in-process timers and Redis state (see
       // `GameRuntimeService.handleRoomEmptied`).
       await this.gameRuntimeService.handleRoomEmptied(roomId)
+    } else if (await this.gameRuntimeService.abandonIfPlayerLeft(roomId, userId)) {
+      // Final-review fix: the room still has members, but the member just
+      // removed (self-leave, kick, ban, or a presence-grace eviction) was
+      // part of an active session's playerIds — GameRuntimeService just
+      // aborted that session and dropped the room back to `lobby` (see its
+      // own doc comment for why lobby, not a force-finish with fabricated
+      // standings). Re-broadcast so everyone still here sees the room leave
+      // `in_game`/`results` immediately, instead of only on their next
+      // unrelated `room:state`.
+      dto = await this.broadcastRoomState(roomId)
     }
     const votes = await this.getVotes(roomId)
     this.server.to(roomId).emit('room:votes', votes)

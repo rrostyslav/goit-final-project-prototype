@@ -1,3 +1,4 @@
+import type { Locale } from './constants'
 import type { ChatMessageDto, NotificationDto, PlayerId, RoomDto, RoomId } from './domain'
 import type { DrawStroke, GameAction, GameEvent, PlayerView } from './game-view'
 import type { GameId } from './games'
@@ -28,7 +29,13 @@ export interface ClientToServerEvents {
     p: { roomId: RoomId; userId: PlayerId },
     ack: (r: Ack<null>) => void,
   ) => void
-  'game:start': (p: { roomId: RoomId }, ack: (r: Ack<null>) => void) => void
+  // `locale` is optional and additive (final-review finding D): older
+  // clients that never send it still work exactly as before —
+  // `GameRuntimeService` falls back to `uk` — this only lets a client that
+  // DOES send one pick which seeded word deck (Alias/Hat/Crocodile) a game
+  // draws from. The server validates it against `SUPPORTED_LOCALES` rather
+  // than trusting the client outright (see that method's own doc comment).
+  'game:start': (p: { roomId: RoomId; locale?: Locale }, ack: (r: Ack<null>) => void) => void
   'game:action': (p: { roomId: RoomId; action: GameAction }, ack: (r: Ack<null>) => void) => void
   'draw:stroke': (p: { roomId: RoomId; stroke: DrawStroke }) => void
   'draw:clear': (p: { roomId: RoomId }) => void

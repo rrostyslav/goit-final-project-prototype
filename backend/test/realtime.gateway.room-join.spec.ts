@@ -24,12 +24,12 @@ interface Emitted {
 const ROOM_ID = 'room-1'
 const USER_ID = 'user-1'
 
-function roomDtoFixture(): RoomDto {
+function roomDtoFixture(status: RoomDto['status'] = 'lobby'): RoomDto {
   return {
     id: ROOM_ID,
     code: 'ABC123',
     visibility: 'public',
-    status: 'lobby',
+    status,
     hostId: 'host-1',
     maxPlayers: 6,
     selectedGameId: null,
@@ -55,6 +55,8 @@ function createFakeSocket(userId: string): { socket: AppSocket; emitted: Emitted
 function createGateway(deps: {
   votesHash: Record<string, string>
   drawContext?: { active: boolean; explainerId: string | null } | null
+  roomStatus?: RoomDto['status']
+  lastStandings?: { sessionId: string; standings: unknown[] } | null
 }): RealtimeGateway {
   const gateway = Object.create(RealtimeGateway.prototype) as RealtimeGateway
   Object.assign(gateway, {
@@ -65,7 +67,7 @@ function createGateway(deps: {
     },
     roomsService: {
       join: jest.fn().mockResolvedValue(undefined),
-      toDto: jest.fn().mockResolvedValue(roomDtoFixture()),
+      toDto: jest.fn().mockResolvedValue(roomDtoFixture(deps.roomStatus)),
     },
     presenceService: {
       markOnline: jest.fn(),
@@ -74,6 +76,7 @@ function createGateway(deps: {
     gameRuntimeService: {
       resumeAfterReconnect: jest.fn().mockResolvedValue(undefined),
       getCrocodileDrawContext: jest.fn().mockResolvedValue(deps.drawContext ?? null),
+      getLastStandings: jest.fn().mockResolvedValue(deps.lastStandings ?? null),
     },
     drawingService: {
       getAll: jest.fn().mockResolvedValue([]),
@@ -120,5 +123,50 @@ describe('RealtimeGateway.onRoomJoin (review fix-up)', () => {
     await gateway.onRoomJoin(socket, { roomId: ROOM_ID })
 
     expect(emitted.map((e) => e.event)).toEqual(expect.arrayContaining(['draw:sync', 'room:votes']))
+  })
+
+  // -------------------------------------------------------------------
+  // Final-review finding F: standings vanish on reload during the 8s
+  // results window, since `game:ended` is push-only and the frontend
+  // store's `standings` only ever resets (never backfills). `onRoomJoin`
+  // now replays a still-fresh standings snapshot to the joining socket
+  // whenever the room is `results` -- see
+  // `GameRuntimeService.getLastStandings`'s own doc comment.
+  // -------------------------------------------------------------------
+  it('backfills game:ended to a socket that joins while the room is still results', async () => {
+    const standings = [{ playerId: 'voter-a', score: 3, placement: 1 }]
+    const gateway = createGateway({
+      votesHash: {},
+      roomStatus: 'results',
+      lastStandings: { sessionId: 'session-1', standings },
+    })
+    const { socket, emitted } = createFakeSocket(USER_ID)
+
+    await gateway.onRoomJoin(socket, { roomId: ROOM_ID })
+
+    const ended = emitted.find((e) => e.event === 'game:ended')
+    expect(ended?.payload).toEqual({ sessionId: 'session-1', standings })
+  })
+
+  it('does not emit game:ended when the room is results but nothing is stored (TTL expired)', async () => {
+    const gateway = createGateway({ votesHash: {}, roomStatus: 'results', lastStandings: null })
+    const { socket, emitted } = createFakeSocket(USER_ID)
+
+    await gateway.onRoomJoin(socket, { roomId: ROOM_ID })
+
+    expect(emitted.some((e) => e.event === 'game:ended')).toBe(false)
+  })
+
+  it('never emits game:ended for a room that is not in results', async () => {
+    const gateway = createGateway({
+      votesHash: {},
+      roomStatus: 'lobby',
+      lastStandings: { sessionId: 'session-1', standings: [] },
+    })
+    const { socket, emitted } = createFakeSocket(USER_ID)
+
+    await gateway.onRoomJoin(socket, { roomId: ROOM_ID })
+
+    expect(emitted.some((e) => e.event === 'game:ended')).toBe(false)
   })
 })

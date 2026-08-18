@@ -189,8 +189,19 @@ function createFakeGameTimerService() {
   }
 }
 
+/** Tracks every `(category, language)` pair it was called with — used by
+ * the final-review finding D locale tests below to assert which deck
+ * `GameRuntimeService.buildDeck` actually asked for, without adding a
+ * test-only hook to the service itself. */
 function createFakeWordDeckService(words: string[]) {
-  return { loadDeck: jest.fn(async () => words) }
+  const calls: { category: string; language: string }[] = []
+  return {
+    calls,
+    loadDeck: jest.fn(async (category: string, language: string) => {
+      calls.push({ category, language })
+      return words
+    }),
+  }
 }
 
 interface EmittedEntry {
@@ -279,6 +290,7 @@ function createRuntime(room: FakeRoom) {
     gameResultModel,
     fakeGameTimerService,
     fakeRedisService,
+    fakeWordDeckService,
   }
 }
 
@@ -524,6 +536,34 @@ describe('GameRuntimeService', () => {
     expect(fakeRoomsService.setStatus).toHaveBeenCalledWith('room1', 'results')
     expect(room.status).toBe('results')
     expect(gateway.emitted.some((e) => e.event === 'game:ended')).toBe(true)
+  })
+
+  // Final-review finding F: the same standings just broadcast in
+  // `game:ended` must also be readable back via `getLastStandings`, so a
+  // socket that joins/reloads during the `results` window can be backfilled
+  // (see `RealtimeGateway.onRoomJoin`'s own wiring test).
+  it('stashes the standings so getLastStandings can replay them to a late joiner', async () => {
+    const { runtime, gateway } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+    const sessionId = sessionIdFrom(gateway)
+
+    expect(await runtime.getLastStandings('room1')).toBeNull()
+
+    await playFullAliasGame(runtime, gateway, 'room1', 'host')
+
+    const ended = gateway.emitted.find((e) => e.event === 'game:ended')
+    if (!ended) throw new Error('expected a game:ended event')
+
+    expect(await runtime.getLastStandings('room1')).toEqual({
+      sessionId,
+      standings: (ended.payload as { standings: unknown }).standings,
+    })
   })
 
   it('clears all session timers when the game finishes', async () => {
@@ -808,6 +848,190 @@ describe('GameRuntimeService reconnect/join always pushes game:state (review fix
 
     const pushed = latestGameState(gateway, notExplainer)
     expect(pushed.kind).toBe('word')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Final-review finding A: a player abandoning a game (evicted after the 45s
+// presence grace, kicked, banned, or a plain self-leave) while the room's
+// active session still counted them among its `playerIds` used to strand
+// the room permanently — nothing ever reacted to a PARTIAL membership loss,
+// only `handleRoomEmptied` (a room reaching zero members). Reproduced live
+// twice, both regression-tested here directly against
+// `abandonIfPlayerLeft` (what `RealtimeGateway.handleMemberRemoved` now
+// calls for exactly this case — see that method's own test coverage in
+// realtime.gateway.member-removed.spec.ts for the wiring, and
+// `doAbandonIfPlayerLeft`'s doc comment for why this returns the room to
+// `lobby` rather than force-finishing with fabricated standings).
+// ---------------------------------------------------------------------------
+describe('GameRuntimeService.abandonIfPlayerLeft (final-review fix: partial membership loss)', () => {
+  it('2-player Durak: the player whose turn it is leaves -- session aborts, room returns to lobby, no bogus GameResult rows', async () => {
+    const { runtime, gateway, room, gameSessionModel, gameResultModel, fakeGameTimerService } =
+      createRuntime({
+        id: 'room1',
+        hostId: 'host',
+        memberIds: ['host', 'g1'],
+        selectedGameId: 'durak',
+        status: 'lobby',
+      })
+    await runtime.start('room1', 'host')
+    const sessionId = sessionIdFrom(gateway)
+    // Before the fix: this player disconnects, the 45s presence grace
+    // expires with no reconnect, and the room is left `in_game` forever
+    // with `turnPlayerId` pointing at someone who can never act again --
+    // `game:start` then refuses with "This room is not in the lobby" and
+    // there is no other escape hatch.
+    const turnPlayerId = latestCardState(gateway, 'host').turnPlayerId
+    if (!turnPlayerId) throw new Error('expected a turnPlayerId')
+
+    const aborted = await runtime.abandonIfPlayerLeft('room1', turnPlayerId)
+
+    expect(aborted).toBe(true)
+    expect(room.status).toBe('lobby')
+    // Not a force-finish: nobody actually won this Durak game, so no
+    // GameResult rows -- a fabricated placement would pollute match history.
+    expect(gameResultModel.rows).toHaveLength(0)
+    expect(fakeGameTimerService.clearAllCalls).toContain(sessionId)
+    const sessionRow = gameSessionModel.rows.find((r) => r.id === sessionId)
+    expect(sessionRow?.endedAt).not.toBeNull()
+
+    // The room is usable again: `game:start` no longer refuses with "not in
+    // the lobby" -- this is the live repro's core complaint, fixed.
+    await expect(runtime.start('room1', 'host')).resolves.toBeUndefined()
+  })
+
+  it('3-player Crocodile: the paused explainer leaves -- session aborts even though the clock was already parked', async () => {
+    const { runtime, gateway, room, gameResultModel } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+    const sessionId = sessionIdFrom(gateway)
+    const explainerId = currentExplainer(gateway, 'host')
+    await runtime.dispatch('room1', explainerId, { type: 'word/start_round' })
+
+    // Before the fix: the explainer's socket drops, `pauseForDisconnect`
+    // parks the clock (see the pause/resume describe block above), and
+    // then the 45s grace expires with no reconnect -- the round stays
+    // `active`/paused forever, since every `word/end_round` from the
+    // remaining players is rejected `not_explainer` (only the explainer who
+    // left could ever send one).
+    await runtime.pauseForDisconnect('room1', explainerId)
+    const paused = readRoundClock(await runtime.snapshot(sessionId))
+    expect(paused.roundEndsAt).toBeNull()
+
+    const aborted = await runtime.abandonIfPlayerLeft('room1', explainerId)
+
+    expect(aborted).toBe(true)
+    expect(room.status).toBe('lobby')
+    expect(gameResultModel.rows).toHaveLength(0)
+  })
+
+  it('no-ops when no game session is active for the room', async () => {
+    const { runtime, room } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1'],
+      selectedGameId: 'durak',
+      status: 'lobby',
+    })
+
+    const aborted = await runtime.abandonIfPlayerLeft('room1', 'g1')
+
+    expect(aborted).toBe(false)
+    expect(room.status).toBe('lobby')
+  })
+
+  it('no-ops when the departing user was never part of the active session', async () => {
+    const { runtime, room } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1'],
+      selectedGameId: 'durak',
+      status: 'lobby',
+    })
+    await runtime.start('room1', 'host')
+
+    // 'someone-else' was never a player in this session (e.g. a spectator
+    // path, or a stale/unrelated user id) -- the active game must be left
+    // completely untouched.
+    const aborted = await runtime.abandonIfPlayerLeft('room1', 'someone-else')
+
+    expect(aborted).toBe(false)
+    expect(room.status).toBe('in_game')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Final-review finding D: `DEFAULT_LOCALE = 'uk'` was hardcoded with no wire
+// event ever carrying a locale, so an English-UI player always got Ukrainian
+// words in Alias/Hat/Crocodile and 292 seeded English word-deck entries were
+// unreachable dead data. `game:start` can now optionally carry the caller's
+// locale (see `ClientToServerEvents['game:start']`'s doc comment in
+// libs/shared/src/events.ts) — these tests cover `GameRuntimeService`'s side
+// of that: which deck it actually asks `WordDeckService` for.
+// ---------------------------------------------------------------------------
+describe('GameRuntimeService locale selection for word-game decks (final-review fix)', () => {
+  it('requests the English deck when the caller explicitly starts with locale "en"', async () => {
+    const { runtime, fakeWordDeckService } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+
+    await runtime.start('room1', 'host', 'en')
+
+    expect(fakeWordDeckService.calls).toEqual([{ category: 'general', language: 'en' }])
+  })
+
+  it('falls back to Ukrainian when no locale is sent at all (an older client)', async () => {
+    const { runtime, fakeWordDeckService } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+
+    await runtime.start('room1', 'host')
+
+    expect(fakeWordDeckService.calls).toEqual([{ category: 'general', language: 'uk' }])
+  })
+
+  it('does not trust the client: an unsupported locale value falls back to Ukrainian rather than being forwarded as-is', async () => {
+    const { runtime, fakeWordDeckService } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2', 'g3'],
+      selectedGameId: 'alias',
+      status: 'lobby',
+    })
+
+    // Cast past the type system the same way a forged/malformed client
+    // payload would arrive at runtime — `resolveLocale` must validate
+    // against SUPPORTED_LOCALES itself, not trust the wire type.
+    await runtime.start('room1', 'host', 'fr' as unknown as 'en')
+
+    expect(fakeWordDeckService.calls).toEqual([{ category: 'general', language: 'uk' }])
+  })
+
+  it('picks the crocodile-specific deck category, still honouring the requested locale', async () => {
+    const { runtime, fakeWordDeckService } = createRuntime({
+      id: 'room1',
+      hostId: 'host',
+      memberIds: ['host', 'g1', 'g2'],
+      selectedGameId: 'crocodile',
+      status: 'lobby',
+    })
+
+    await runtime.start('room1', 'host', 'en')
+
+    expect(fakeWordDeckService.calls).toEqual([{ category: 'crocodile', language: 'en' }])
   })
 })
 

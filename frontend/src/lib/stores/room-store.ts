@@ -6,6 +6,7 @@ import type {
   GameAction,
   GameEvent,
   GameId,
+  Locale,
   NotificationDto,
   PlayerId,
   PlayerView,
@@ -72,7 +73,13 @@ interface RoomState {
   sendChat: (text: string) => Promise<void>
   selectGame: (gameId: GameId) => Promise<void>
   voteGame: (gameId: GameId) => Promise<void>
-  startGame: () => Promise<void>
+  /** `locale` is the caller's current UI locale (final-review finding D) —
+   * forwarded as-is on `game:start` so `GameRuntimeService` can pick the
+   * matching seeded word deck for Alias/Hat/Crocodile instead of always
+   * defaulting to Ukrainian. Optional: omitting it (or the socket layer
+   * dropping it) degrades to the same `uk` fallback the server always used
+   * before this existed — never a hard failure. */
+  startGame: (locale?: Locale) => Promise<void>
   sendAction: (action: GameAction) => Promise<void>
   kick: (userId: PlayerId) => Promise<void>
   ban: (userId: PlayerId) => Promise<void>
@@ -433,10 +440,10 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     await emitWithAck(s, 'room:vote_game', { roomId, gameId })
   },
 
-  startGame: async () => {
+  startGame: async (locale) => {
     const roomId = requireRoomId(get)
     const s = ensureSocket()
-    await emitWithAck(s, 'game:start', { roomId })
+    await emitWithAck(s, 'game:start', { roomId, locale })
   },
 
   sendAction: async (action) => {

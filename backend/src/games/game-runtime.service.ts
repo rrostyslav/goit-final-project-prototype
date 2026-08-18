@@ -19,7 +19,7 @@ import type {
   SessionId,
   UserId,
 } from '@gp/shared'
-import { getGameMeta } from '@gp/shared'
+import { getGameMeta, SUPPORTED_LOCALES } from '@gp/shared'
 import { BadRequestException, Injectable, Logger, type OnModuleDestroy } from '@nestjs/common'
 import { InjectModel } from '@nestjs/sequelize'
 import { GameResult } from '../database/models/game-result.model'
@@ -74,6 +74,22 @@ function sessionKey(roomId: RoomId): string {
   return `room:session:${roomId}`
 }
 
+/** Final-review finding F: where `doFinish` stashes the standings it just
+ * computed, so a socket that joins (a genuine first join, OR a reload —
+ * `room:join` covers both, see `onRoomJoin`) while the room is still
+ * `results` can be caught up rather than rendering an empty list. See
+ * `getLastStandings`'s doc comment for the full rationale. */
+function standingsKey(roomId: RoomId): string {
+  return `room:standings:${roomId}`
+}
+
+/** Comfortably longer than `RESULTS_TO_LOBBY_MS` (8s) so a normal join
+ * during the results window always finds it, while still bounded so a
+ * lookup years from now (after `returnToLobby`'s own explicit cleanup
+ * somehow never ran) cannot resurrect a stale result for an unrelated
+ * future game in the same room. */
+const LAST_STANDINGS_TTL_SECONDS = 30
+
 /** Same key convention `RealtimeGateway`'s exported `lockKey` uses for every
  * `room:*` mutation (`room:join`, `room:leave`, `room:kick`, `room:ban`,
  * `room:transfer_host`) — duplicated here as a plain string builder rather
@@ -85,8 +101,11 @@ function sessionKey(roomId: RoomId): string {
  * `pauseForDisconnect`, `resumeAfterReconnect`) takes this same lock, so a
  * concurrent `game:action`/`game:start`/timer-fire/disconnect/reconnect for
  * one room can never interleave its read and write with another's — see
- * this task's fix report for the lost-update race this closes. The lock is
- * acquired at exactly one level (these five entry points) and nowhere
+ * this task's fix report for the lost-update race this closes.
+ * `abandonIfPlayerLeft` (added by the final-review fix for a player
+ * abandoning a game — see that method's doc comment) is the sixth entry
+ * point that takes this same lock, for the same reason. The lock is
+ * acquired at exactly one level (these six entry points) and nowhere
  * inside them, so none of them can ever nest a second acquisition of their
  * own room's lock and stall waiting on themselves. */
 function lockKey(roomId: RoomId): string {
@@ -102,6 +121,15 @@ function lockKey(roomId: RoomId): string {
  * are covered by the end-to-end smoke test in this task's report. */
 function votesKey(roomId: RoomId): string {
   return `votes:${roomId}`
+}
+
+/** Matches `ServerToClientEvents['game:ended']`'s inline `standings` element
+ * shape exactly — named here only so `getLastStandings` has something to
+ * return besides a repeated inline type. */
+interface GameStanding {
+  playerId: PlayerId
+  score: number
+  placement: number
 }
 
 /**
@@ -205,11 +233,13 @@ export class GameRuntimeService implements OnModuleDestroy {
    * 'lobby'` check and both create a session — the whole
    * check-then-create-then-persist sequence is the read-modify-write this
    * lock protects, exactly like `dispatch` below. */
-  async start(roomId: RoomId, requesterId: UserId): Promise<void> {
-    await this.redisService.withLock(lockKey(roomId), () => this.doStart(roomId, requesterId))
+  async start(roomId: RoomId, requesterId: UserId, locale?: Locale): Promise<void> {
+    await this.redisService.withLock(lockKey(roomId), () =>
+      this.doStart(roomId, requesterId, locale),
+    )
   }
 
-  private async doStart(roomId: RoomId, requesterId: UserId): Promise<void> {
+  private async doStart(roomId: RoomId, requesterId: UserId, locale?: Locale): Promise<void> {
     await this.roomsService.assertHost(roomId, requesterId)
     const room = await this.roomsService.toDto(roomId)
 
@@ -232,7 +262,7 @@ export class GameRuntimeService implements OnModuleDestroy {
     const definition = getGameDefinition(meta.id)
     const seed = this.nextSeed()
     const now = this.now()
-    const deck = await this.buildDeck(meta.id, meta.engine, seed)
+    const deck = await this.buildDeck(meta.id, meta.engine, seed, this.resolveLocale(locale))
 
     const state = definition.init({ players: playerIds, seed, options: {}, deck, now })
 
@@ -358,7 +388,7 @@ export class GameRuntimeService implements OnModuleDestroy {
    * me", so it would just retry against its own still-held lock until
    * `LOCK_ACQUIRE_TIMEOUT_MS` and then proceed anyway — a multi-second stall
    * on every single game finish, for no correctness benefit. The lock is
-   * acquired at exactly one level (the five entry points named on `lockKey`)
+   * acquired at exactly one level (the six entry points named on `lockKey`)
    * and this is deliberately not one of them. */
   private async doFinish(sessionId: SessionId): Promise<void> {
     const loaded = await this.loadGame(sessionId)
@@ -386,6 +416,17 @@ export class GameRuntimeService implements OnModuleDestroy {
       score: r.score,
       placement: r.placement,
     }))
+    // Final-review finding F: stash the same payload just broadcast so a
+    // socket that joins (a fresh join, or a reload — `room:join` covers
+    // both) while the room is still `results` can be caught up by
+    // `RealtimeGateway.onRoomJoin` instead of rendering an empty list — see
+    // `getLastStandings`.
+    await this.redisService.client.set(
+      standingsKey(loaded.roomId),
+      JSON.stringify({ sessionId, standings }),
+      'EX',
+      LAST_STANDINGS_TTL_SECONDS,
+    )
     await this.broadcastToPlayers(loaded.playerIds, 'game:ended', { sessionId, standings })
     await this.requireGateway().broadcastRoomState(loaded.roomId)
 
@@ -496,15 +537,98 @@ export class GameRuntimeService implements OnModuleDestroy {
     }
   }
 
+  /** Locked for its entire body, same rationale as `pauseForDisconnect`/
+   * `resumeAfterReconnect` above: called from
+   * `RealtimeGateway.handleMemberRemoved`, which does NOT hold
+   * `lockKey(roomId)` by the time it calls this — the `roomsService.leave`/
+   * `kick`/`ban` lock (or the presence-eviction handler's own lock) has
+   * already resolved and released before `handleMemberRemoved` runs — so
+   * this is a fresh acquisition, never a nested one.
+   *
+   * Final-review fix: before this existed, only a fully-emptied room
+   * (`handleRoomEmptied` below) ever tore down a stuck session. A single
+   * departing player — evicted after the 45s presence grace, kicked,
+   * banned, or a plain self-leave — while an active session's `playerIds`
+   * still included them left that session waiting forever on someone who
+   * could never act again. Live-reproduced twice: 2-player Durak stuck
+   * `in_game` with `turnPlayerId` pointing at the evicted player forever
+   * after (`game:start` then refuses with "This room is not in the lobby" —
+   * no escape hatch existed anywhere in `ClientToServerEvents`), and
+   * 3-player Crocodile stuck paused (`pauseForDisconnect` already parked the
+   * clock on disconnect) with every `word/end_round` from the remaining
+   * players rejected `not_explainer`, since the explainer who left can never
+   * send one.
+   *
+   * Returns whether it actually aborted a session, so
+   * `RealtimeGateway.handleMemberRemoved` knows whether the room's status
+   * just changed and a fresh `broadcastRoomState` is worth another round
+   * trip. */
+  async abandonIfPlayerLeft(roomId: RoomId, userId: PlayerId): Promise<boolean> {
+    return this.redisService.withLock(lockKey(roomId), () =>
+      this.doAbandonIfPlayerLeft(roomId, userId),
+    )
+  }
+
+  /**
+   * Decision: return the room to `lobby`, NOT `doFinish`. `doFinish` calls
+   * `definition.results(state)`, and every one of the five games' own
+   * contract assumes that only ever runs against a state that genuinely
+   * reached `finished` — a real winner/ranking to report and persist as
+   * `GameResult` rows a player later reads back as their own match history.
+   * The state left behind by a player leaving mid-round is not that: Durak's
+   * defender can be mid-take, Nine's board mid-sequence, Crocodile's clock
+   * paused on an incomplete round. "Whatever standings exist" at that exact
+   * instant is not a result, it is an artifact of precisely when someone
+   * happened to leave — persisting it as `GameResult` rows would hand every
+   * remaining player (and the one who left) a fabricated placement in their
+   * match history for a game nobody actually finished. The remaining
+   * players' most likely next move is picking a new game together, not
+   * reviewing a meaningless result screen for one that never really ended —
+   * so this clears the session exactly like `handleRoomEmptied` below does
+   * (same three Redis/Postgres writes, no `GameResult` rows, no
+   * `game:ended`) and drops the room straight back to `lobby`, skipping
+   * `results` (and its 8s countdown) entirely, rather than arming a
+   * countdown toward a "result" that was never real.
+   *
+   * No-ops (returns `false`) when there is no active session for this room,
+   * or there is one but `userId` was never one of its `playerIds` — e.g. a
+   * room member who joined mid-game after the session already started, or a
+   * departure unrelated to any running session, never had anything for this
+   * session to wait on. */
+  private async doAbandonIfPlayerLeft(roomId: RoomId, userId: PlayerId): Promise<boolean> {
+    const loaded = await this.tryLoadActiveGame(roomId)
+    if (!loaded?.playerIds.includes(userId)) return false
+
+    this.gameTimerService.clearAll(loaded.sessionId)
+    await this.redisService.client.del(stateKey(loaded.sessionId))
+    await this.redisService.client.del(sessionKey(roomId))
+    await this.gameSessionModel.update(
+      { endedAt: new Date() },
+      { where: { id: loaded.sessionId, endedAt: null } },
+    )
+    await this.roomsService.setStatus(roomId, 'lobby')
+    return true
+  }
+
   /** Called by `RealtimeGateway.handleMemberRemoved` once a room's member
    * list is empty (self-leave, kick, ban, or a presence-grace eviction all
    * funnel through that one method). Cancels a pending `results -> lobby`
    * timer if one was scheduled, and — if a game session is still active for
    * this room — clears its in-process timers and Redis state without
    * writing `GameResult` rows (an emptied room did not "finish" its game
-   * the way `finish()` means it; it was abandoned). */
+   * the way `finish()` means it; it was abandoned). This is the OTHER half
+   * of the same review fix `abandonIfPlayerLeft` above handles: that one
+   * covers a departing player while the room still has other members left
+   * in it; this one covers the room having no members left at all — see
+   * `RealtimeGateway.handleMemberRemoved` for how the two are dispatched
+   * between. */
   async handleRoomEmptied(roomId: RoomId): Promise<void> {
     this.cancelLobbyReturn(roomId)
+    // A room that closes while showing `results` (its session already torn
+    // down by `doFinish`) must not leave a stale standings backfill behind
+    // either — see `standingsKey`'s doc comment. Harmless even without this
+    // (the key is TTL'd, and a closed room is never rejoined), but cheap.
+    await this.redisService.client.del(standingsKey(roomId))
 
     const sessionId = await this.redisService.client.get(sessionKey(roomId))
     if (!sessionId) return
@@ -555,6 +679,21 @@ export class GameRuntimeService implements OnModuleDestroy {
     const view = loaded.definition.view(loaded.state, anyPlayerId)
     if (view.kind !== 'word') return null
     return { active: view.phase === 'active', explainerId: view.explainerId }
+  }
+
+  /** Final-review finding F: `RealtimeGateway.onRoomJoin`'s hook for
+   * catching a joining/reloading socket up on a still-fresh `game:ended` —
+   * see `standingsKey`'s doc comment for why this exists and `doFinish` for
+   * where the value comes from. Returns `null` once the TTL has expired, the
+   * room has moved on (`returnToLobby` deletes this proactively), or no game
+   * has ever finished in this room at all — every one of those reads as "no
+   * catch-up needed," never an error. */
+  async getLastStandings(
+    roomId: RoomId,
+  ): Promise<{ sessionId: SessionId; standings: GameStanding[] } | null> {
+    const raw = await this.redisService.client.get(standingsKey(roomId))
+    if (!raw) return null
+    return JSON.parse(raw) as { sessionId: SessionId; standings: GameStanding[] }
   }
 
   onModuleDestroy(): void {
@@ -702,19 +841,34 @@ export class GameRuntimeService implements OnModuleDestroy {
     gameId: GameId,
     engine: 'word' | 'card',
     seed: number,
+    locale: Locale,
   ): Promise<string[] | undefined> {
     if (engine !== 'word') return undefined
     // Ambiguity resolution (see this task's report): word games take the
-    // 'general' deck except Crocodile, which takes 'crocodile'. Language
-    // comes from the room in principle, but there is no per-room locale yet
-    // — defaults to 'uk' until a future task surfaces one.
+    // 'general' deck except Crocodile, which takes 'crocodile'.
     const category = gameId === 'crocodile' ? 'crocodile' : 'general'
-    const words = await this.wordDeckService.loadDeck(category, DEFAULT_LOCALE)
+    const words = await this.wordDeckService.loadDeck(category, locale)
     // The word-engine's own contract: "the deck is supplied already
     // shuffled by the caller" — this service is that caller, using the same
     // seed handed to `definition.init` so a session's deck order is
     // reproducible from its own seed.
     return createRng(seed).shuffle(words)
+  }
+
+  /** Final-review finding D: `game:start` can now optionally carry the
+   * caller's UI locale (see `ClientToServerEvents['game:start']`'s own doc
+   * comment) so an English-UI player actually gets English words in Alias/
+   * Hat/Crocodile instead of always drawing from the Ukrainian deck — 292
+   * seeded English word-deck entries were otherwise unreachable dead data.
+   * Never trusts the client's value outright: anything not in
+   * `SUPPORTED_LOCALES` (including `undefined` from an older client, or a
+   * malformed/forged payload past whatever the socket layer already
+   * validates) falls back to `DEFAULT_LOCALE`, exactly like the hardcoded
+   * behaviour before this fix. */
+  private resolveLocale(candidate: Locale | undefined): Locale {
+    return candidate !== undefined && (SUPPORTED_LOCALES as readonly string[]).includes(candidate)
+      ? candidate
+      : DEFAULT_LOCALE
   }
 
   private isWaitingOn(view: PlayerView, userId: PlayerId): boolean {
@@ -749,6 +903,11 @@ export class GameRuntimeService implements OnModuleDestroy {
 
   private async returnToLobby(roomId: RoomId): Promise<void> {
     await this.roomsService.setStatus(roomId, 'lobby')
+    // The results window is over — a fresh `game:start` will produce a new
+    // `game:ended` of its own later; this one must not linger and answer a
+    // future `getLastStandings` lookup with a stale result from a different
+    // game (see `standingsKey`'s doc comment).
+    await this.redisService.client.del(standingsKey(roomId))
     await this.requireGateway().broadcastRoomState(roomId)
   }
 

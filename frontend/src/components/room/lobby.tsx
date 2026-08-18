@@ -12,7 +12,7 @@ import { useAuthStore } from '@/lib/stores/auth-store'
 import { useRoomStore } from '@/lib/stores/room-store'
 
 export function Lobby() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const room = useRoomStore((s) => s.room)
   const votes = useRoomStore((s) => s.votes)
   const setReady = useRoomStore((s) => s.setReady)
@@ -54,7 +54,7 @@ export function Lobby() {
     setStartError(null)
     setIsStarting(true)
     try {
-      await startGame()
+      await startGame(locale)
     } catch (err) {
       setStartError(err instanceof SocketAckError ? err.message : t('room.startGameError'))
     } finally {
