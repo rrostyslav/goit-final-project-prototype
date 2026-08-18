@@ -1,0 +1,38 @@
+# Child Application (app-of-apps pattern) for charts/livekit.
+# See charts/applications/backend-api.yaml for the full explanation of how
+# this file is discovered and why it deploys via Helm.
+#
+# Unlike backend-api/frontend, nothing in Task 27's CI workflows touches
+# charts/livekit (its brief only lists backend-deploy.yml/
+# frontend-deploy.yml) — LiveKit isn't part of this repo's own build, it's
+# a third-party image (see charts/livekit/values.yaml's image.repository:
+# livekit/livekit-server). This Application's automated sync still matters
+# though: it's what actually applies charts/livekit to the cluster at all,
+# and it self-heals if the Service/Deployment/ConfigMap ever drift from
+# what's committed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: livekit
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    # Same placeholder as backend-api.yaml — see that file's comment.
+    repoURL: https://github.com/your-org/your-repo.git
+    targetRevision: main
+    path: charts/livekit
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gameplatform
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

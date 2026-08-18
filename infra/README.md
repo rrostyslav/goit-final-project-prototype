@@ -173,24 +173,59 @@ only be confirmed by an `apply` against a real cluster (or `helm pull`/
 of this task). Don't read the green `terraform validate` as proof the
 chart references are correct — it isn't that.
 
-## Argo CD root Application — a real gap, not glossed over
+## Argo CD root Application — Directory-vs-Helm gap, resolved in Task 26
 
-The root `Application` (`modules/argo_cd`) uses Argo CD's plain Directory
-source type pointed at `charts/`, since `charts/backend-api`,
-`charts/frontend` and `charts/livekit` (Task 26) are sibling Helm chart
-directories, not a flat set of manifests. A plain Directory source applies
-whatever it finds under that path as raw Kubernetes YAML — it does not
-itself run `helm template` on a subdirectory just because that
-subdirectory has a `Chart.yaml`. For this root Application to actually
-deploy those three charts as Helm releases, Task 26 (or a follow-up) needs
-either one small per-chart `Application` manifest checked in alongside
-each chart (the classic app-of-apps child-manifest layout — `directory.recurse
-= true` is already set so they'd be discovered automatically), or this
-resource needs to become an `ApplicationSet` with a git-directory
-generator instead. This task only owns the root `Application`'s own
-configuration (helm_release + syncPolicy.automated), which is what the
-brief asks for; wiring the child side is out of scope here and called out
-so it isn't silently assumed to already work.
+Task 25 originally flagged a real gap here: the root `Application`
+(`modules/argo_cd`) uses Argo CD's plain Directory source type pointed at
+`charts/`, since `charts/backend-api`, `charts/frontend` and
+`charts/livekit` (Task 26) are sibling Helm chart directories, not a flat
+set of manifests. A plain Directory source applies whatever it finds under
+that path as raw Kubernetes YAML — it does not itself run `helm template`
+on a subdirectory just because that subdirectory has a `Chart.yaml`. Worse
+than just "not deploying the charts": naively recursing into the full
+`charts/` tree would try to apply `charts/backend-api/templates/*.yaml`
+(raw Helm template files full of `{{ }}` Go template syntax) as literal
+Kubernetes manifests and fail outright.
+
+**Task 26 closes this end to end:**
+
+1. `modules/argo_cd/main.tf`'s root Application now sets
+   `directory.exclude = "backend-api/**,frontend/**,livekit/**"` alongside
+   `recurse = true`, so its raw-manifest scan skips all three chart
+   directories and only picks up `charts/applications/*.yaml`.
+2. `charts/applications/backend-api.yaml`, `frontend.yaml` and
+   `livekit.yaml` are three small, flat `Application` manifests (the
+   classic app-of-apps child-manifest layout) — each one's own
+   `spec.source.path` points directly at its chart directory (e.g.
+   `charts/backend-api`) with **no** `directory` block, so Argo CD
+   auto-detects the `Chart.yaml` there and renders that source with Helm
+   instead of applying it as raw YAML. Each carries its own
+   `syncPolicy.automated: { prune: true, selfHeal: true }` and
+   `repoURL`/`targetRevision` matching this module's `gitops_repo_url`/
+   `gitops_branch` variables (placeholder values matching
+   `terraform.tfvars.example`'s own example shape, since these are plain
+   YAML files, not Terraform-templated, and can't reference the HCL
+   variables directly — kept in sync by convention).
+
+**The loop, traced end to end:** Task 27's `backend-deploy.yml` builds an
+image, pushes it to ECR, and uses `yq` to bump
+`charts/backend-api/values.yaml`'s `image.tag` to the built commit SHA,
+then commits and pushes that change to `main` (`frontend-deploy.yml` does
+the same for `charts/frontend`). The root Application's own automated
+sync (polling this repo) re-applies `charts/applications/*.yaml` — a no-op
+if those files themselves didn't change. The relevant child
+Application's `syncPolicy.automated` independently notices that ITS
+tracked path (e.g. `charts/backend-api`) changed on `main`, re-renders it
+with Helm, and applies the diff. No human ever runs `helm upgrade`
+anywhere in that path.
+
+The alternative considered and not taken: converting the root resource
+into an `ApplicationSet` with a git-directory generator, which would
+discover chart directories automatically instead of relying on three
+checked-in files. The three static `Application` manifests were chosen
+instead — simpler to read, review, and reason about for a three-chart
+prototype, at the cost of one more file to add by hand if a fourth chart
+is ever introduced.
 
 ## GitHub OIDC trust policy — scope decision
 
@@ -246,24 +281,45 @@ defaults:
 Every one of these is a variable with a documented default — bump them for
 real load without touching module internals.
 
-## Networking notes for later tasks
+## Networking notes — resolved in Task 26
 
 - The application's WebSocket gateway (Socket.IO, same port as the REST
-  API) is long-lived. Neither this module nor `modules/eks` creates any
-  ingress/ALB for the backend API — that's Task 26's `charts/backend-api`
-  Service — but whichever one it adds needs an explicit idle-timeout
-  override (the AWS ALB default is 60s), or it will silently kill
-  idle-but-alive game sessions.
+  API) is long-lived. Task 26's `charts/backend-api/templates/ingress.yaml`
+  targets the AWS Load Balancer Controller's `alb` IngressClass and sets
+  `alb.ingress.kubernetes.io/load-balancer-attributes:
+  idle_timeout.timeout_seconds=3600` (a load-balancer-level attribute, not
+  a target-group one) — overriding ALB's 60s default so an idle-but-alive
+  lobby/voice connection doesn't get silently killed. That controller
+  itself is **not** installed anywhere in this Terraform configuration
+  (`modules/eks` installs `metrics-server` only) — the Ingress object is
+  valid and renders correctly, but sits inert with no controller to
+  satisfy it until `aws-load-balancer-controller` is installed on the
+  target cluster. Not implemented here since it wasn't in either task's
+  brief; flagged so it isn't mistaken for already wired up.
 - LiveKit needs TCP 7880/7881, a UDP media port range, and UDP 3478 for
-  TURN, exposed via a `LoadBalancer` Kubernetes Service (Task 26, **not**
-  `hostNetwork: true` and **not** a manual NodePort mapping — spec 8.2).
-  This VPC's public subnets are tagged `kubernetes.io/role/elb` precisely
-  so that Service can provision an NLB there; no Terraform-level security
-  group or NACL in this module or `modules/eks` restricts those ports —
-  the EKS-managed cluster security group governs node-to-node and
-  control-plane traffic, not what a `LoadBalancer` Service exposes
-  externally, which AWS's own NLB/Service-created security groups handle.
+  TURN, exposed via a `LoadBalancer` Kubernetes Service (Task 26's
+  `charts/livekit/templates/service.yaml`, **not** `hostNetwork: true` and
+  **not** a manual NodePort mapping — spec 8.2). That Service uses the
+  legacy in-tree AWS cloud provider's own
+  `service.beta.kubernetes.io/aws-load-balancer-type: nlb` annotation
+  (works without the controller above, since UDP needs an NLB, not the
+  Classic Load Balancer a bare `LoadBalancer` Service gets by default) and
+  provisions into this VPC's public subnets via the `kubernetes.io/role/
+  elb` tag mentioned below. **Operational caveat, not verified against a
+  real account:** 101 UDP ports (the 50000-50100 range) plus 2 TCP
+  listeners is 103 listeners on one NLB — likely above the default AWS
+  quota for listeners per Network Load Balancer, so a real deploy may need
+  a quota increase request before this Service provisions successfully.
+  No Terraform-level security group or NACL in this module or
+  `modules/eks` restricts those ports — the EKS-managed cluster security
+  group governs node-to-node and control-plane traffic, not what a
+  `LoadBalancer` Service exposes externally, which AWS's own NLB/
+  Service-created security groups handle.
 - `modules/eks` installs `metrics-server` specifically because
   `charts/backend-api`'s `HorizontalPodAutoscaler` (Task 26, spec 2.5)
-  needs it to read CPU/memory metrics — without it the HPA object exists
-  but never scales anything.
+  needs it to read CPU/memory metrics. That HPA is disabled by default
+  (`autoscaling.enabled: false` in `charts/backend-api/values.yaml`) —
+  the backend keeps presence state in-process, so scaling replicas up is
+  a correctness regression today, not added capacity (see that chart's
+  `replicaCount` comment) — but `metrics-server` is still required
+  infrastructure for whenever that's enabled later.

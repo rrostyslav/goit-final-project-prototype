@@ -1,0 +1,32 @@
+# Child Application (app-of-apps pattern) for charts/frontend.
+# See charts/applications/backend-api.yaml for the full explanation of how
+# this file is discovered and why it deploys via Helm — same mechanism,
+# same loop: Task 27's frontend-deploy.yml bumps
+# charts/frontend/values.yaml's image.tag on every push to main touching
+# frontend/**, this Application's own automated sync picks up that commit.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: frontend
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    # Same placeholder as backend-api.yaml — see that file's comment.
+    repoURL: https://github.com/your-org/your-repo.git
+    targetRevision: main
+    path: charts/frontend
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gameplatform
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

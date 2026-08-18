@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "livekit.fullname" . }}
+  labels:
+    {{- include "livekit.labels" . | nindent 4 }}
+spec:
+  # Always 1 — see values.yaml's replicaCount comment (in-process SFU
+  # state, not horizontally scalable the way the stateless charts are).
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: {{ .Values.deploymentStrategy }}
+  selector:
+    matchLabels:
+      {{- include "livekit.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "livekit.selectorLabels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config"
+            - "/etc/livekit/livekit.yaml"
+          env:
+            - name: LIVEKIT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "livekit.secretName" . }}
+                  key: LIVEKIT_KEYS
+          ports:
+            # NOTE: containerPort entries are documentation only (they do
+            # not open/restrict ports — a container's network namespace
+            # has every port available by default); they're listed here
+            # for readability, not because Kubernetes needs them to route
+            # traffic. The UDP media range is NOT enumerated here for that
+            # reason — see templates/service.yaml, which is what actually
+            # publishes each port.
+            - name: signaling
+              containerPort: {{ .Values.livekit.port }}
+              protocol: TCP
+            - name: rtc-tcp
+              containerPort: {{ .Values.livekit.rtc.tcpPort }}
+              protocol: TCP
+            - name: turn-udp
+              containerPort: {{ .Values.livekit.turn.udpPort }}
+              protocol: UDP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/livekit
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "livekit.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "livekit.fullname" . }}
+  labels:
+    {{- include "livekit.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "livekit.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: signaling
+      port: {{ .Values.livekit.port }}
+      targetPort: {{ .Values.livekit.port }}
+      protocol: TCP
+    - name: rtc-tcp
+      port: {{ .Values.livekit.rtc.tcpPort }}
+      targetPort: {{ .Values.livekit.rtc.tcpPort }}
+      protocol: TCP
+    - name: turn-udp
+      port: {{ .Values.livekit.turn.udpPort }}
+      targetPort: {{ .Values.livekit.turn.udpPort }}
+      protocol: UDP
+    # ---------------------------------------------------------------------
+    # UDP media port range (livekit.rtc.portRangeStart..portRangeEnd, 101
+    # ports by default: 50000-50100). A Kubernetes Service cannot express
+    # a port RANGE as a single spec entry — each port needs its own `port`/
+    # `targetPort` pair — so this generates one entry per port instead of
+    # a NodePort mapping or hostNetwork (both explicitly disallowed by the
+    # brief). This is the same pattern LiveKit's own published Helm chart
+    # uses for this exact problem.
+    #
+    # OPERATIONAL CAVEAT (flagged, not glossed over): 101 UDP ports + 2 TCP
+    # ports = 103 listeners on one Network Load Balancer. AWS's default
+    # NLB listener quota is well below that (historically ~50) — deploying
+    # this for real will very likely need an AWS service quota increase
+    # for "Listeners per Network Load Balancer" before the Service can
+    # actually provision successfully. Not something `helm template`/
+    # `helm lint` can catch; called out here so it isn't discovered only
+    # at apply time.
+    # ---------------------------------------------------------------------
+    {{- range $port := untilStep (int .Values.livekit.rtc.portRangeStart) (int (add1 .Values.livekit.rtc.portRangeEnd)) 1 }}
+    - name: rtc-udp-{{ $port }}
+      port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: UDP
+    {{- end }}

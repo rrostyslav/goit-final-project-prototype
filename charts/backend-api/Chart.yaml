@@ -1,0 +1,8 @@
+apiVersion: v2
+name: backend-api
+description: >-
+  NestJS REST API (mounted under /api) and Socket.IO realtime gateway
+  (namespace /rt, same port) for the game platform backend.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

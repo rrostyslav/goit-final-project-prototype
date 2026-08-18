@@ -1,0 +1,10 @@
+apiVersion: v2
+name: livekit
+description: >-
+  Self-hosted LiveKit SFU for the game platform's voice rooms. Config is
+  mirrored from the repo-root livekit.dev.yaml (used by docker-compose for
+  local dev), with the API key/secret pair moved to a Kubernetes Secret
+  instead of being inlined into the server config.
+type: application
+version: 0.1.0
+appVersion: "latest"

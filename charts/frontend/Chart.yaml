@@ -1,0 +1,9 @@
+apiVersion: v2
+name: frontend
+description: >-
+  Next.js frontend for the game platform (App Router, port 3000).
+  NEXT_PUBLIC_* config is baked in at Docker image build time, not
+  runtime — see values.yaml before assuming this chart can reconfigure it.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

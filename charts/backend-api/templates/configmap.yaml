@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "backend-api.fullname" . }}
+  labels:
+    {{- include "backend-api.labels" . | nindent 4 }}
+data:
+  NODE_ENV: {{ .Values.config.nodeEnv | quote }}
+  PORT: {{ .Values.service.targetPort | quote }}
+  CORS_ORIGIN: {{ .Values.config.corsOrigin | quote }}
+  JWT_ACCESS_TTL: {{ .Values.config.jwtAccessTtl | quote }}
+  JWT_REFRESH_TTL: {{ .Values.config.jwtRefreshTtl | quote }}
+  LIVEKIT_URL: {{ .Values.config.livekitUrl | quote }}
+  GOOGLE_CLIENT_ID: {{ .Values.config.googleClientId | quote }}
+  GOOGLE_CALLBACK_URL: {{ .Values.config.googleCallbackUrl | quote }}

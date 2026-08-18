@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "livekit.fullname" . }}
+  labels:
+    {{- include "livekit.labels" . | nindent 4 }}
+data:
+  # Mirrors livekit.dev.yaml's shape exactly, EXCEPT the `keys:` block —
+  # see values.yaml's `secrets` section for why that moved to a Secret +
+  # the LIVEKIT_KEYS env var instead of living in this ConfigMap.
+  livekit.yaml: |
+    port: {{ .Values.livekit.port }}
+    rtc:
+      tcp_port: {{ .Values.livekit.rtc.tcpPort }}
+      port_range_start: {{ .Values.livekit.rtc.portRangeStart }}
+      port_range_end: {{ .Values.livekit.rtc.portRangeEnd }}
+      use_external_ip: {{ .Values.livekit.rtc.useExternalIp }}
+    turn:
+      enabled: {{ .Values.livekit.turn.enabled }}
+      udp_port: {{ .Values.livekit.turn.udpPort }}
+    logging:
+      level: {{ .Values.livekit.logging.level }}

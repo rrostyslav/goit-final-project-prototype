@@ -1,0 +1,357 @@
+# Default values for charts/backend-api.
+#
+# This is the NestJS process that serves REST under /api AND a Socket.IO
+# realtime gateway (namespace /rt) on the SAME port (backend/src/main.ts:
+# app.setGlobalPrefix('api'); backend/src/realtime/realtime.gateway.ts:
+# namespace: SOCKET_NAMESPACE = '/rt'). Every key below is commented.
+#
+# Prototype-scale defaults throughout (resources, replica counts, HPA
+# ceilings): chosen for cost, matching infra/README.md's "Prototype-scale
+# defaults" section, NOT load-tested. Bump before running this under real
+# traffic.
+
+# -----------------------------------------------------------------------
+# Replicas
+# -----------------------------------------------------------------------
+# Fixed at 1 by default. WHY: presence state (who is online, who is in
+# which room right now) is held IN-PROCESS in this service — see
+# backend/src/realtime/realtime.gateway.ts. The Socket.IO Redis adapter IS
+# wired up (backend/src/realtime/redis-io.adapter.ts, via
+# @socket.io/redis-adapter) and DOES fan broadcasts/emits out across
+# replicas correctly, but that only synchronizes MESSAGES between
+# instances — it does not make the in-memory presence maps themselves
+# consistent across them. Run 2 replicas today and two pods can each
+# believe they hold the authoritative presence for the same room: a real
+# correctness bug, not a scaling headroom question. Raise this only after
+# presence state itself moves into Redis (or another shared store); until
+# then, more replicas make behavior worse, not more capable. See
+# autoscaling.enabled below for how the HPA respects this same reasoning.
+replicaCount: 1
+
+image:
+  # ECR repository URL for this image, e.g.
+  # <account-id>.dkr.ecr.<region>.amazonaws.com/backend-api — see
+  # infra/modules/ecr's `repository_urls` output. Left empty deliberately:
+  # this is a value committed to git, and the real URL is account-specific
+  # and only exists after `terraform apply`. Per the brief's own guidance,
+  # a deploy-time-only value gets left empty here, not faked. Set it once
+  # (edit this file directly, or override via a values file / Argo CD
+  # Application `helm.parameters`) before the first real deploy — Task
+  # 27's backend-deploy.yml workflow never touches this field, only
+  # image.tag below.
+  repository: ""
+  # Image tag. Task 27's backend-deploy.yml bumps this via `yq` to the
+  # built commit SHA on every push to main touching backend/**, libs/**,
+  # or charts/backend-api/**, then commits the change back to main so Argo
+  # CD's automated sync notices the diff and redeploys (spec §8.4 per the
+  # design doc — docs/superpowers/specs/2026-08-17-game-platform-design.md
+  # line 267). Left empty here so the *template* falls back to the
+  # chart's own `appVersion` (see templates/deployment.yaml) rather than
+  # rendering an actual empty tag before CI has bumped it for the first
+  # time.
+  tag: ""
+  # IfNotPresent is fine given ECR's IMMUTABLE tag policy
+  # (infra/modules/ecr's image_tag_mutability) — a given tag's content
+  # never changes underneath a cached pull.
+  pullPolicy: IfNotPresent
+
+# nameOverride/fullnameOverride: standard Helm chart-name escape hatches,
+# empty by default (use the chart's own name-derived defaults).
+nameOverride: ""
+fullnameOverride: ""
+
+# -----------------------------------------------------------------------
+# Pod-level configuration
+# -----------------------------------------------------------------------
+
+# Extra annotations merged onto the pod template (e.g. for a metrics
+# scraper). Empty by default.
+podAnnotations: {}
+
+# Pod-level securityContext: run as a non-root UID (matches Task 27's
+# Dockerfile, whose runtime stage runs `node dist/main.js` as a non-root
+# user) and set fsGroup so any mounted volume is group-writable by that
+# UID.
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+
+# Container-level securityContext: locked down beyond the pod defaults —
+# fixed non-root UID, no privilege escalation, all Linux capabilities
+# dropped. readOnlyRootFilesystem is left false because Nest/Node commonly
+# wants to write to /tmp; flip to true plus an explicit emptyDir at /tmp if
+# that's ever verified to be unnecessary.
+securityContext:
+  runAsUser: 1000
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+# How long Kubernetes waits after sending SIGTERM before force-killing the
+# pod. backend/src/main.ts calls app.enableShutdownHooks(), so SIGTERM
+# triggers NestJS's OnApplicationShutdown hooks (RedisService closes its
+# connections there — see that file's own comment on why the ordering
+# matters for the Socket.IO Redis adapter) rather than an instant kill.
+# But in-flight HTTP requests and, more importantly, open Socket.IO/
+# WebSocket connections for live games and voice signaling need real
+# wall-clock time to finish a turn or reconnect elsewhere. 60s balances
+# "let an in-flight game round / voice session drain or reconnect" against
+# "don't stall a rolling deploy indefinitely."
+terminationGracePeriodSeconds: 60
+
+# Sleep this long in a preStop hook BEFORE SIGTERM is sent. This is the
+# other half of the graceful-drain story: it gives the Ingress/LoadBalancer
+# time to notice the pod is terminating and stop routing NEW connections to
+# it (deregistration lag), so the pod doesn't keep receiving fresh
+# WebSocket handshakes during the window it's also trying to shut down in.
+preStopSleepSeconds: 5
+
+# Extra raw env entries appended after the ConfigMap/Secret-derived ones
+# below (templates/deployment.yaml). Empty by default; format is the
+# standard PodSpec `env` array ([{name: ..., value: ...}] or
+# valueFrom-based entries).
+extraEnv: []
+
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+# -----------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    cpu: 500m
+    memory: 384Mi
+
+# -----------------------------------------------------------------------
+# Probes — both point at GET /api/health (backend/src/health/
+# health.controller.ts), which answers without touching the database or
+# Redis (it just reports config-derived feature flags: voice/oauth
+# enabled). That makes it safe to reuse for BOTH readiness (can this pod
+# take traffic right now) and liveness (is the process alive at all) —
+# unlike a DB-backed check, which would fail during a brief DB blip and
+# cause Kubernetes to needlessly kill and restart an otherwise-healthy
+# process.
+# -----------------------------------------------------------------------
+probes:
+  path: /api/health
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# -----------------------------------------------------------------------
+# Service
+# -----------------------------------------------------------------------
+service:
+  # ClusterIP: external exposure goes through the Ingress below, not
+  # directly through this Service.
+  type: ClusterIP
+  # Port the Service listens on (cluster-internal callers, and what the
+  # Ingress below forwards to).
+  port: 4000
+  # Port the container actually listens on. backend/src/config/env.config.ts
+  # defaults PORT to 4000 (matches .env.example); this value also becomes
+  # the ConfigMap's PORT entry (templates/configmap.yaml), so the two never
+  # drift apart.
+  targetPort: 4000
+
+# -----------------------------------------------------------------------
+# Ingress
+# -----------------------------------------------------------------------
+ingress:
+  # Renders the Ingress by default so `helm template`/`helm lint` exercise
+  # it for review. Set to false if the target cluster has no Ingress
+  # controller installed yet.
+  enabled: true
+
+  # Targets the AWS Load Balancer Controller's "alb" IngressClass — see
+  # the WEBSOCKET IDLE-TIMEOUT DECISION comment on `annotations` below for
+  # why ALB specifically. NOTE: infra/modules/eks/main.tf installs
+  # metrics-server only; it does NOT install aws-load-balancer-controller.
+  # This Ingress object is valid Kubernetes config either way, but it sits
+  # inert — no Service ever gets provisioned — until that controller is
+  # installed on the target cluster (out of scope for this chart; flagged
+  # here so it isn't mistaken for "the ALB already exists").
+  className: "alb"
+
+  # ---------------------------------------------------------------------
+  # WEBSOCKET IDLE-TIMEOUT DECISION
+  #
+  # The Socket.IO realtime gateway shares this exact port/Ingress with the
+  # REST API and holds long-lived connections (a lobby waiting for
+  # players, a voice-only screen between rounds). AWS's Application Load
+  # Balancer — what the "alb" IngressClass above provisions — defaults its
+  # OWN idle timeout to 60 SECONDS and will silently close any connection,
+  # including a perfectly healthy but quiet WebSocket, once it's been idle
+  # longer than that. That's a real product failure: a player sitting in
+  # a lobby for 90 seconds gets silently disconnected.
+  #
+  # Fix: `alb.ingress.kubernetes.io/load-balancer-attributes` below sets
+  # `idle_timeout.timeout_seconds=3600` (1 hour). This is a LOAD-BALANCER
+  # level attribute (not a target-group attribute — those are a different
+  # annotation, `target-group-attributes`, used for things like
+  # deregistration_delay/stickiness), and it is the specific, documented
+  # AWS Load Balancer Controller annotation for this exact problem. ALB
+  # supports the WebSocket protocol natively over the standard HTTP/1.1
+  # Upgrade handshake — no separate annotation is needed to allow
+  # upgrades through, only this timeout override.
+  # ---------------------------------------------------------------------
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /api/health
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+
+  # Public hostname this Ingress answers for (e.g. api.example.com). Left
+  # empty: a real DNS name only exists once this is actually deployed to a
+  # real domain — deploy-time value, not something to fake here.
+  host: ""
+
+  # TLS config, Ingress-spec shape: [{ hosts: [...], secretName: "..." }].
+  # Left empty for the same reason as `host` — an ACM certificate ARN
+  # (set via the alb.ingress.kubernetes.io/certificate-arn annotation,
+  # added alongside `host` at deploy time) or a cert-manager-issued Secret
+  # only exists once a real domain is attached.
+  tls: []
+
+# -----------------------------------------------------------------------
+# HorizontalPodAutoscaler
+# -----------------------------------------------------------------------
+autoscaling:
+  # Disabled by default, deliberately. See replicaCount's comment above:
+  # presence state is in-process, so more than 1 replica is a correctness
+  # regression today, not added capacity. Leaving the HPA ON by default
+  # would let it silently push replicas above 1 under CPU/memory pressure,
+  # which is exactly the scenario replicaCount's comment warns about. Flip
+  # this on only once presence state has moved to Redis (or another shared
+  # store).
+  enabled: false
+  # Matches replicaCount (1) on purpose, so that if this is ever flipped
+  # on without re-reading the comment above, the Deployment still never
+  # starts below the single-instance assumption everything else here is
+  # built on — minReplicas does not silently contradict replicaCount.
+  minReplicas: 1
+  # Prototype ceiling, chosen for cost — not a load-tested number.
+  maxReplicas: 3
+  # HPA target metrics: CPU and memory, per spec §2.5 (design doc
+  # references "розділ 2.2 ТЗ" / HPA requirement; see task-25-brief.md's
+  # citation of the same section for metrics-server).
+  targetCPUUtilizationPercentage: 75
+  targetMemoryUtilizationPercentage: 75
+
+# -----------------------------------------------------------------------
+# ServiceAccount
+# -----------------------------------------------------------------------
+serviceAccount:
+  # Whether this chart creates a ServiceAccount for the backend-api pods.
+  create: true
+  # Explicit ServiceAccount name; empty means "use the chart's fullname".
+  # Only read when create is true.
+  name: ""
+  # IRSA (IAM Roles for Service Accounts) annotation: binds this
+  # ServiceAccount to an IAM role via the EKS cluster's OIDC provider
+  # (infra/modules/eks's oidc_provider_arn/oidc_provider_url outputs), so
+  # pods can call AWS APIs — e.g. reading the RDS master password from
+  # Secrets Manager (infra/modules/rds's manage_master_user_password =
+  # true) — without any static AWS access keys anywhere. The role ARN is
+  # account- and role-specific and only exists after `terraform apply`
+  # creates it; left empty here for the same "don't fake a deploy-time
+  # value" reason as image.repository above. Set to
+  # arn:aws:iam::<account-id>:role/<role-name> at deploy time.
+  annotations:
+    eks.amazonaws.com/role-arn: ""
+
+# -----------------------------------------------------------------------
+# Non-secret configuration (rendered into a ConfigMap — templates/
+# configmap.yaml). Every one of these appears in .env.example undisguised;
+# none of them are credentials.
+# -----------------------------------------------------------------------
+config:
+  # Passed straight through to NODE_ENV.
+  nodeEnv: production
+  # Allowed CORS origin for the REST API + Socket.IO handshake
+  # (backend/src/main.ts: app.enableCors({ origin: config.corsOrigin })).
+  # Must match wherever charts/frontend's Ingress host ends up being
+  # (e.g. https://app.example.com) — left at the docker-compose/local
+  # default since the real value is only known once that chart's
+  # ingress.host is set; update both together at deploy time.
+  corsOrigin: "http://localhost:3000"
+  # Access token lifetime (zod-parsed duration string, e.g. "15m"). Not
+  # secret material — it's a duration, not key data.
+  jwtAccessTtl: "15m"
+  # Refresh token lifetime, same reasoning as jwtAccessTtl.
+  jwtRefreshTtl: "30d"
+  # LiveKit server URL handed to clients so they know where to connect for
+  # voice (e.g. wss://livekit.example.com). Not secret — it's a hostname,
+  # not key material. Point this at charts/livekit's exposed address once
+  # that's known. backend/src/config/env.config.ts treats voice as
+  # disabled (GET /api/health reports voice: false) whenever this is
+  # empty, so leaving it empty here is a safe, functional default, not a
+  # broken one.
+  livekitUrl: ""
+  # Google OAuth client ID. Google's own documentation treats the client
+  # ID as safe to expose client-side (it's embedded in every OAuth
+  # redirect URL by design) — unlike the client secret, which IS real
+  # credential material and lives in the Secret instead (templates/
+  # secret.yaml). Empty disables Google login app-side (see
+  # AppConfigService.oauthEnabled).
+  googleClientId: ""
+  # URL Google redirects back to after consent. Not secret — just a URL;
+  # must match whatever's registered in the Google Cloud OAuth client
+  # configuration.
+  googleCallbackUrl: "http://localhost:4000/api/auth/google/callback"
+
+# -----------------------------------------------------------------------
+# Secret configuration (rendered into a Secret — templates/secret.yaml —
+# and consumed via secretKeyRef in templates/deployment.yaml, never
+# inlined directly as plain env `value:` entries).
+#
+# EVERY value below is deliberately an empty string. This file is
+# committed to git; DATABASE_URL, REDIS_URL, both JWT signing secrets, the
+# LiveKit server credentials, and the Google OAuth client secret must
+# never be inlined here — not even as a placeholder that looks real.
+# Provide real values only at deploy time (--set/-f from a secret
+# manager, CI-injected --set flags, sealed-secrets, etc.), never by
+# editing this file.
+#
+# Deviation note: the task brief's env-var sentence explicitly calls out
+# "DATABASE_URL, REDIS_URL, both JWT secrets and the LiveKit credentials"
+# as the secrets, and doesn't re-mention GOOGLE_CLIENT_SECRET in that same
+# clause (even though it's listed earlier in the same sentence's full env
+# var list). Treated as secret material here anyway — it's a Google OAuth
+# client secret, unambiguously credential data, and the repo-wide "no
+# secrets inlined, ever" constraint governs regardless of whether one
+# summary sentence's enumeration was exhaustive.
+# -----------------------------------------------------------------------
+secrets:
+  # Whether this chart creates the Secret object below from these values.
+  # Default true for prototype convenience (dev/staging, where real values
+  # are injected via --set or a separate, gitignored values file at deploy
+  # time — never committed). Set false and use existingSecretName instead
+  # once this moves to a real secret store (AWS Secrets Manager via
+  # External Secrets Operator, Sealed Secrets, etc).
+  create: true
+  # Name of a pre-existing Secret to read from instead, when create is
+  # false. Only read in that mode.
+  existingSecretName: ""
+  databaseUrl: ""
+  redisUrl: ""
+  jwtAccessSecret: ""
+  jwtRefreshSecret: ""
+  livekitApiKey: ""
+  livekitApiSecret: ""
+  googleClientSecret: ""

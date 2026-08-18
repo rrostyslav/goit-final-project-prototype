@@ -1,0 +1,88 @@
+# Child Application (app-of-apps pattern) for charts/backend-api.
+#
+# Discovered by the root Application's Directory source (infra/modules/
+# argo_cd/main.tf, `path = "charts"`, `directory.recurse = true`) — this
+# file lives under charts/applications/, which that Directory source's
+# `exclude` list deliberately does NOT skip (it only excludes
+# backend-api/**, frontend/** and livekit/** — the chart directories
+# themselves). Argo CD applies this file as a plain Kubernetes manifest,
+# which creates the Application resource below; Argo CD's own controller
+# then reconciles THAT Application by rendering charts/backend-api with
+# Helm (auto-detected: `source.path` below points at a directory
+# containing a Chart.yaml and has no `directory` block of its own, unlike
+# the root Application above it).
+#
+# This is how the loop actually closes end to end:
+#   1. Task 27's backend-deploy.yml builds an image, pushes it to ECR,
+#      and uses `yq` to bump charts/backend-api/values.yaml's `image.tag`
+#      to the built commit SHA, then commits and pushes that change to
+#      main.
+#   2. Argo CD's root Application (self-healing, polling this repo) sees
+#      main move and re-applies charts/applications/*.yaml — a no-op here
+#      since this file itself didn't change.
+#   3. This child Application's own `syncPolicy.automated` (independent of
+#      the root's) notices ITS tracked path (charts/backend-api) changed
+#      on main and re-syncs: `helm template charts/backend-api` now
+#      renders the new image.tag, and Argo CD applies the diff to the
+#      cluster.
+# No human runs `helm upgrade` anywhere in that path.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backend-api
+  # Must match modules/argo_cd's `namespace` variable (default "argocd",
+  # infra/modules/argo_cd/variables.tf) — Application custom resources are
+  # watched by the Argo CD controller in its own installation namespace.
+  namespace: argocd
+  # Ensures Argo CD garbage-collects everything this Application deployed
+  # if the Application resource itself is ever deleted (standard
+  # app-of-apps hygiene, recommended by Argo CD's own docs).
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # Matches modules/argo_cd's `argocd_project` variable (default
+  # "default", infra/modules/argo_cd/variables.tf).
+  project: default
+
+  source:
+    # Placeholder matching infra/terraform.tfvars.example's own
+    # gitops_repo_url example shape — must be set to this repository's
+    # real Git URL before this Application can sync anything, matching
+    # whatever is supplied to modules/argo_cd's `gitops_repo_url`
+    # Terraform variable (infra/main.tf passes var.gitops_repo_url
+    # through unchanged). Not a Terraform-templated file, so it can't
+    # reference that variable directly — kept in sync by convention, the
+    # same way infra/terraform.tfvars.example documents the expected
+    # value.
+    repoURL: https://github.com/your-org/your-repo.git
+    # Matches modules/argo_cd's `gitops_branch` variable (default "main").
+    targetRevision: main
+    # Points directly at the chart directory. No `directory:` block here
+    # (that's what makes the ROOT Application apply raw manifests instead
+    # of rendering Helm) — Argo CD auto-detects a Helm source because this
+    # path contains a Chart.yaml.
+    path: charts/backend-api
+    # No `helm.parameters`/`valuesObject` override here: this Application
+    # deploys charts/backend-api's own values.yaml exactly as committed,
+    # which is the whole point of step 3 above — CI's commit to
+    # values.yaml IS the deploy trigger, not a parameter passed from here.
+    # Real per-environment overrides (e.g. image.repository, once the ECR
+    # URL is known post-`terraform apply` — see that chart's values.yaml)
+    # belong in a `helm.valuesObject` block added here at deploy time, not
+    # invented as a fake value now.
+
+  destination:
+    server: https://kubernetes.default.svc
+    # Application namespace — deliberately different from `metadata.
+    # namespace` above (which is Argo CD's own control-plane namespace).
+    # Named after the project ("gameplatform" from
+    # infra/terraform.tfvars.example), not reused from the argo_cd
+    # module's namespace variable.
+    namespace: gameplatform
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

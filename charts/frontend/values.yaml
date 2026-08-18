@@ -1,0 +1,158 @@
+# Default values for charts/frontend.
+#
+# ---------------------------------------------------------------------
+# IMPORTANT — NEXT_PUBLIC_API_URL and NEXT_PUBLIC_WS_URL are BUILD-TIME
+# values, not runtime ones, and this chart deliberately does NOT expose
+# them as configurable keys anywhere below.
+#
+# Next.js inlines every `NEXT_PUBLIC_*` env var directly into the
+# client-side JavaScript bundle during `next build` — it is a static
+# string substitution done once, at build time, not something the running
+# Node process reads on each request. frontend/src/lib/api.ts and
+# frontend/src/lib/socket.ts both read `process.env.NEXT_PUBLIC_API_URL` /
+# `process.env.NEXT_PUBLIC_WS_URL`, and by the time this chart's image is
+# running in a pod, those reads have already been replaced with literal
+# strings baked in by whatever build args Task 27's frontend Dockerfile
+# was given.
+#
+# Setting a `NEXT_PUBLIC_API_URL` container env var here (via a ConfigMap,
+# `--set`, or anything else at the Kubernetes level) would have ZERO
+# effect on an already-built image — the client bundle already shipped
+# with whatever URL was baked in, and the server process doesn't
+# re-read this var for that purpose either. Deliberately not implying
+# otherwise: there is no such key in this file. To actually change these
+# URLs, rebuild the image with new Docker build args and roll out the new
+# image tag — this chart cannot do it at deploy time, full stop.
+# ---------------------------------------------------------------------
+
+replicaCount: 1
+
+image:
+  # ECR repository URL for this image. See charts/backend-api/values.yaml
+  # for why this is empty by default (account-specific, only known after
+  # `terraform apply` — a deploy-time value, not something to fake here).
+  repository: ""
+  # Image tag. Task 27's frontend-deploy.yml bumps this via `yq` the same
+  # way as backend-api's own deploy workflow, triggered by changes under
+  # frontend/**. Left empty so the template falls back to the chart's own
+  # appVersion (see templates/deployment.yaml) before CI has bumped it.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+
+securityContext:
+  runAsUser: 1000
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+# Next.js page requests are short-lived (unlike the backend's WebSocket
+# connections), so there's no long-drain requirement here — a shorter
+# grace period than backend-api's is fine.
+terminationGracePeriodSeconds: 30
+
+extraEnv: []
+
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+resources:
+  # Prototype-scale defaults, chosen for cost — not load-tested.
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# -----------------------------------------------------------------------
+# Probes — the frontend has no dedicated health endpoint (unlike the
+# backend's GET /api/health), so both probes hit the root page instead.
+# A working page load is a reasonable proxy for "the Next.js server is up
+# and can serve traffic."
+# -----------------------------------------------------------------------
+probes:
+  path: /
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+service:
+  type: ClusterIP
+  port: 3000
+  # Matches Next.js's default listen port for `node server.js` in
+  # standalone output mode (Task 27's frontend Dockerfile), also mirrored
+  # into the ConfigMap's PORT entry so the two can't drift apart.
+  targetPort: 3000
+
+ingress:
+  enabled: true
+  # See charts/backend-api/values.yaml's ingress.className comment — same
+  # controller, same "not installed by this repo's Terraform" caveat.
+  className: "alb"
+  # No idle-timeout override here: unlike backend-api, this Ingress only
+  # ever carries plain page-load HTTP requests (no WebSocket/long-lived
+  # connection ever terminates on the frontend), so ALB's default 60s
+  # idle timeout is fine as-is.
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /
+  # Public hostname (e.g. app.example.com). Left empty — deploy-time
+  # value, see charts/backend-api's identical field for the reasoning.
+  host: ""
+  tls: []
+
+# No HorizontalPodAutoscaler for this chart (brief: "same shape, no HPA").
+# The frontend is stateless per request (no in-process presence state
+# like backend-api), so autoscaling it wouldn't hit the same correctness
+# problem — it's simply out of scope for this chart per the brief, not
+# because it would be unsafe to add later.
+
+serviceAccount:
+  create: true
+  name: ""
+  # The frontend makes no direct AWS API calls today (it only talks to
+  # backend-api over HTTP/WebSocket), so this is usually left as-is.
+  # Kept for shape-parity with backend-api's chart and in case future work
+  # needs one (e.g. reading a runtime config object from S3) without a
+  # chart change.
+  annotations: {}
+
+# Non-secret runtime configuration (rendered into a ConfigMap — templates/
+# configmap.yaml). Deliberately does NOT include NEXT_PUBLIC_API_URL /
+# NEXT_PUBLIC_WS_URL — see the top-of-file comment.
+config:
+  nodeEnv: production
+
+# Secret configuration (rendered into a Secret — templates/secret.yaml —
+# only if non-empty; see that template). The frontend has no runtime
+# secrets today (no DATABASE_URL/REDIS_URL/etc. — it only calls
+# backend-api's public HTTP/WebSocket API). `extra` exists purely for
+# forward-compatibility (e.g. a future server-only API token) without
+# needing a chart change; empty by default, and — same rule as every
+# other secrets block in this repo's charts — never populate it with a
+# real value in this committed file.
+secrets:
+  create: true
+  existingSecretName: ""
+  extra: {}

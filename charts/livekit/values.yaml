@@ -1,0 +1,191 @@
+# Default values for charts/livekit.
+#
+# Mirrors the repo-root livekit.dev.yaml (used by docker-compose for local
+# dev — see that file and docker-compose.yml's `livekit` service) with two
+# deliberate differences, each explained where it matters below:
+#   1. `keys:` (the API key/secret pair) is NOT part of the rendered
+#      config file — it's supplied via the LIVEKIT_KEYS env var instead,
+#      sourced from a Kubernetes Secret, so no credential ever lands in a
+#      ConfigMap or in this values.yaml file. See the `secrets` section.
+#   2. `rtc.use_external_ip` defaults to true here (docker-compose's dev
+#      config sets it false, correct for a localhost-only setup) — see
+#      that key's own comment below.
+
+replicaCount: 1
+# Exactly 1 replica, not configurable as a separate `autoscaling` block
+# the way charts/backend-api's is: LiveKit's SFU keeps each room's WebRTC
+# media-routing state in-process on whichever pod that room's
+# participants first connected to (spec §5 / docs/superpowers/specs/
+# 2026-08-17-game-platform-design.md's "Voice" section — the simple
+# self-hosted single-node mode this chart mirrors, not LiveKit's separate
+# multi-node/Redis-backed clustering, which is not configured here). A
+# second replica would just be a second, unsynchronized SFU that some
+# clients land on and others don't — not more capacity, the same class of
+# problem charts/backend-api's replicaCount comment describes for
+# presence state.
+
+image:
+  repository: livekit/livekit-server
+  # "latest" matches docker-compose.yml's own `image:
+  # livekit/livekit-server:latest` exactly, since this chart is meant to
+  # run the same server dev already runs against. Pin this to a specific
+  # released tag before treating this as a real deployment — "latest" on
+  # a stateful SFU means an unplanned image change on next rollout could
+  # silently bump the server version.
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Recreate, not the Kubernetes default RollingUpdate: an SFU pod holds
+# live WebRTC media sessions. Rolling a new pod in beside the old one
+# behind the same LoadBalancer Service means some participants land on
+# the new pod and others stay on the old one for the SAME room, which
+# breaks the room exactly the way a second replica would (see replicaCount
+# above). Recreate drops active voice sessions on deploy — acceptable for
+# a prototype — rather than silently splitting a room across two SFU
+# instances.
+deploymentStrategy: Recreate
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+# WebRTC media sessions in progress deserve a moment to wind down, but
+# there's no application-level shutdown-hook drain here the way
+# backend-api has (livekit-server is a third-party binary) — kept short
+# and mostly as a safety margin for the container runtime itself.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+resources:
+  # Prototype-scale defaults, chosen for cost — not load-tested. An SFU's
+  # CPU cost scales with concurrent participants/tracks; size up before
+  # running this with real room counts.
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# -----------------------------------------------------------------------
+# LiveKit server config — rendered into a ConfigMap (templates/
+# configmap.yaml) as /etc/livekit/livekit.yaml, mounted read-only and
+# passed via `--config`. Field names/defaults below match livekit.dev.yaml
+# 1:1 except where commented otherwise.
+# -----------------------------------------------------------------------
+livekit:
+  # HTTP/signaling port (WebSocket handshake clients connect to first).
+  port: 7880
+  rtc:
+    # TCP fallback for WebRTC media when UDP is blocked by a restrictive
+    # client-side network.
+    tcpPort: 7881
+    # UDP media port range. 101 ports (50000-50100), matching
+    # livekit.dev.yaml exactly. See templates/service.yaml's own comment
+    # for how a Kubernetes Service exposes an entire port RANGE (it can't
+    # express a range directly — one port entry per port is generated) and
+    # the AWS NLB listener-count implication of that.
+    portRangeStart: 50000
+    portRangeEnd: 50100
+    # true here, false in livekit.dev.yaml. WHY THE DEFAULT DIFFERS:
+    # livekit.dev.yaml is a localhost-only dev config (docker-compose),
+    # where there's no external IP to advertise in the first place.
+    # Deployed behind the LoadBalancer Service this chart creates,
+    # LiveKit needs to advertise that Service's externally-reachable
+    # IP/hostname in its ICE candidates so browsers outside the cluster
+    # can actually establish a media connection — without this, clients
+    # would try to connect to the SFU's internal pod IP and silently
+    # fail. This is LiveKit's own documented deployment guidance for
+    # exactly this "behind a cloud load balancer" scenario.
+    useExternalIp: true
+  turn:
+    # Per spec §2.3 (design doc line 190: "docker-compose... з dev-ключами
+    # й turn.enabled: true") — the embedded TURN server, used as a
+    # last-resort relay when direct UDP/TCP media fails (restrictive
+    # NATs/firewalls).
+    enabled: true
+    udpPort: 3478
+  logging:
+    level: info
+
+# -----------------------------------------------------------------------
+# Service — LoadBalancer type per the brief, exposing TCP 7880/7881 and
+# the UDP port range + TURN port. No hostNetwork, no manual NodePort
+# mapping (spec §8.2).
+# -----------------------------------------------------------------------
+service:
+  type: LoadBalancer
+  annotations:
+    # UDP (media + TURN) requires a Network Load Balancer — the default
+    # Classic Load Balancer a bare `type: LoadBalancer` Service
+    # provisions on EKS only speaks TCP/HTTP. This is the legacy in-tree
+    # AWS cloud provider's own NLB annotation, which works WITHOUT
+    # installing aws-load-balancer-controller (unlike charts/backend-api's
+    # Ingress annotations) — appropriate here since infra/modules/eks/
+    # main.tf installs metrics-server only, not that controller.
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # Places the NLB in the public subnets tagged kubernetes.io/role/elb
+    # (infra/modules/vpc — see infra/README.md's "Networking notes"),
+    # rather than requiring every node to be internet-reachable itself.
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    # Operational note (not implemented by an annotation here — flagged,
+    # not hand-waved): if this cluster later gets
+    # aws-load-balancer-controller installed and this Service is switched
+    # to that controller's management (`aws-load-balancer-type:
+    # "external"`), also add
+    # `service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"`
+    # for direct pod-IP routing instead of the legacy provider's
+    # NodePort-per-node instance routing. Left out by default here since
+    # it's specific to that controller, which isn't installed.
+
+# =========================================================================
+# Secret configuration (rendered into a Secret — templates/secret.yaml —
+# consumed via a single LIVEKIT_KEYS env var, never inlined into the
+# ConfigMap above).
+#
+# WHY NOT `keys:` IN THE CONFIGMAP (the way livekit.dev.yaml has it):
+# livekit.dev.yaml's `keys: { devkey: devsecret... }` block is real
+# authentication credential material — the same API key/secret pair the
+# backend uses via LIVEKIT_API_KEY/LIVEKIT_API_SECRET (charts/backend-api)
+# to mint room tokens. Baking that into a ConfigMap here would violate the
+# repo-wide "secret material is referenced by secretKeyRef, never
+# inlined" rule, even though the dev file's own placeholder value is
+# obviously fake. LiveKit supports supplying the exact same key/secret
+# pair via the LIVEKIT_KEYS environment variable instead of the `keys:`
+# YAML block (format: "<api-key>: <api-secret>", comma-separated for
+# multiple pairs) — that's what templates/secret.yaml +
+# templates/deployment.yaml wire up instead.
+#
+# Deviation note: the task brief's template list for this chart
+# (Chart.yaml, values.yaml, templates/{deployment,service,configmap,
+# _helpers.tpl}) does not include a secret.yaml. Added one anyway — the
+# repo-wide "no secrets inlined, ever" constraint is a hard rule that
+# overrides a chart's specific file-list omission, the same judgment call
+# applied to backend-api's GOOGLE_CLIENT_SECRET (see that chart's
+# values.yaml). Without it, the only alternative would have been putting
+# real key material in the ConfigMap, which is exactly what's prohibited.
+# =========================================================================
+secrets:
+  create: true
+  existingSecretName: ""
+  # Format: "<api-key>: <api-secret>" (LiveKit's own LIVEKIT_KEYS syntax).
+  # Must be the SAME credential pair as charts/backend-api's
+  # secrets.livekitApiKey/secrets.livekitApiSecret — this is one shared
+  # secret between the two services, not two independent ones. Left empty
+  # deliberately; provide via --set/-f at deploy time, never commit a
+  # real value here.
+  livekitKeys: ""

@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "backend-api.fullname" . }}
+  labels:
+    {{- include "backend-api.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "backend-api.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Forces a rollout whenever the ConfigMap content changes, so a
+        # config change (e.g. CORS_ORIGIN) actually takes effect instead
+        # of silently sitting unused in already-running pods.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "backend-api.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "backend-api.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          lifecycle:
+            preStop:
+              exec:
+                # See preStopSleepSeconds's comment in values.yaml: gives
+                # the Ingress/LoadBalancer time to stop routing new
+                # connections here before SIGTERM starts the shutdown-hook
+                # drain below.
+                command: ["sh", "-c", "sleep {{ .Values.preStopSleepSeconds }}"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "backend-api.fullname" . }}
+          env:
+            # Required at process start (backend/src/config/env.config.ts
+            # has no default for either — schema.parse throws without
+            # them), so no `optional: true` here: a pod missing these
+            # SHOULD fail to start rather than run half-configured.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: REDIS_URL
+            - name: JWT_ACCESS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: JWT_ACCESS_SECRET
+            - name: JWT_REFRESH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: JWT_REFRESH_SECRET
+            # Optional at process start — voice/Google login are
+            # feature-flagged off when these are absent (see
+            # AppConfigService.voiceEnabled/oauthEnabled), so a Secret
+            # that doesn't define these keys (e.g. a hand-authored
+            # existingSecretName) should not block the pod from starting.
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: LIVEKIT_API_KEY
+                  optional: true
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: LIVEKIT_API_SECRET
+                  optional: true
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "backend-api.secretName" . }}
+                  key: GOOGLE_CLIENT_SECRET
+                  optional: true
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
