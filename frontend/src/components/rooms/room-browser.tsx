@@ -3,7 +3,8 @@
 import type { GameId, RoomBrowserEntry, RoomStatus } from '@gp/shared'
 import { GAME_CATALOG } from '@gp/shared'
 import Link from 'next/link'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { CreateRoomDialog } from '@/components/rooms/create-room-dialog'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -125,6 +126,8 @@ export function RoomBrowser() {
 
   return (
     <div className="flex w-full max-w-3xl flex-col gap-6">
+      <RemovalNotice />
+
       <div className="flex flex-wrap items-end justify-between gap-4">
         <h1 className="text-2xl font-bold text-fg">{t('room.browserTitle')}</h1>
         {!hasHydrated ? null : user ? (
@@ -213,5 +216,60 @@ export function RoomBrowser() {
         initialGameId={gameFilter || null}
       />
     </div>
+  )
+}
+
+/** Shown after the room page routes here following a `room:kicked` event
+ * (see room/[code]/page.tsx's own comment) -- `?notice=kick|ban` carries the
+ * translated explanation across that navigation, since the room page itself
+ * is gone by the time the user reads it. `useSearchParams()` opts its caller
+ * out of static rendering unless wrapped in `<Suspense>` (Next.js's own
+ * requirement); isolating that to this small subtree keeps the rest of
+ * `/rooms` prerendered exactly as it was before this component existed. */
+function RemovalNotice() {
+  return (
+    <Suspense fallback={null}>
+      <RemovalNoticeInner />
+    </Suspense>
+  )
+}
+
+function RemovalNoticeInner() {
+  const { t } = useI18n()
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const notice = searchParams.get('notice')
+
+  if (notice !== 'kick' && notice !== 'ban') {
+    return null
+  }
+
+  return (
+    <Card className="flex items-center justify-between gap-4">
+      <p className="text-sm text-danger">
+        {notice === 'ban' ? t('room.kickedBanned') : t('room.kickedByHost')}
+      </p>
+      <button
+        type="button"
+        onClick={() => router.replace('/rooms')}
+        aria-label={t('common.close')}
+        className="rounded-md p-1 text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg"
+      >
+        <CloseIcon />
+      </button>
+    </Card>
+  )
+}
+
+function CloseIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+      <path
+        d="M4 4L14 14M14 4L4 14"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+    </svg>
   )
 }
